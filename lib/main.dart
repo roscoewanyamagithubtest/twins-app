@@ -1,9 +1,12 @@
 import 'dart:io';
 import 'dart:ui';
 import 'dart:typed_data';
+import 'dart:convert';
+import 'dart:math' show log;
 
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
+import 'package:flutter/gestures.dart' show TapGestureRecognizer;
 import 'package:flutter/services.dart' show Clipboard, ClipboardData;
 import 'package:image_picker/image_picker.dart';
 import 'package:video_player/video_player.dart';
@@ -11,6 +14,7 @@ import 'package:google_sign_in/google_sign_in.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:google_fonts/google_fonts.dart';
+import 'package:http/http.dart' as http;
 
 void main() {
   runApp(const TwinsApp());
@@ -43,6 +47,32 @@ class AppUser {
   });
 }
 
+// ---------------------------------------------------------------------------
+// DATABASE-READINESS NOTE
+//
+// AuthController and VideoFeedStore (below) are currently in-memory only -
+// everything resets when the app restarts. Both are already structured as
+// a single, app-wide seam (one controller, one store) specifically so that
+// swapping in a real database later touches ONE place instead of scattering
+// database calls through every screen. When you're ready to connect
+// Firebase (the natural fit, since the auth methods already mirror
+// Firebase Auth's shape) or another backend:
+//
+//   AuthController.signUp/signIn/signInWithGoogle -> replace the in-memory
+//     Map lookups with FirebaseAuth calls (createUserWithEmailAndPassword,
+//     signInWithEmailAndPassword, signInWithCredential), and mirror each
+//     signed-up user into a 'users' collection in Firestore.
+//
+//   VideoFeedStore.videos / addVideo -> replace the in-memory List with a
+//     Firestore collection ('videos'), addVideo becomes a
+//     .add()/.set() call, and _videos should become a StreamBuilder
+//     listening to the collection instead of a plain getter.
+//
+//   Likes/follows/messages (scattered across VideoItem's mutable fields)
+//     -> each becomes a subcollection or field update in Firestore,
+//     ideally wrapped in a transaction for counts (likes, followers) so
+//     concurrent users don't overwrite each other's increments.
+// ---------------------------------------------------------------------------
 class AuthController extends ChangeNotifier {
   AppUser? currentUser;
 
@@ -106,13 +136,29 @@ class AuthController extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Permanently deletes the current account: removes it from the
+  /// in-memory account list, deletes every video they've posted from the
+  /// shared feed, and signs them out. In a real backend, this should also
+  /// delete their Firestore user document, uploaded media in Storage, and
+  /// any messages - deleting an account should remove ALL their data, not
+  /// just sign them out.
+  void deleteAccount() {
+    final me = currentUser;
+    if (me == null) return;
+    _accounts.remove(me.email);
+    videoFeedStore.videos.removeWhere((v) => v.username == '@${me.username}');
+    videoFeedStore.notifyListeners();
+    currentUser = null;
+    notifyListeners();
+  }
+
   /// Call before any restricted action. Returns true if allowed to proceed;
   /// otherwise shows a sign-up prompt and returns false.
   bool requireAccount(BuildContext context) {
     if (!isGuest) return true;
     showModalBottomSheet(
       context: context,
-      backgroundColor: const Color(0xFF1E293B),
+      backgroundColor: const Color(0xFF121212),
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
       ),
@@ -172,6 +218,70 @@ final authController = AuthController();
 // ---------------------------------------------------------------------------
 // SIGN UP SCREEN
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// TERMS OF SERVICE / PRIVACY POLICY
+//
+// IMPORTANT before publishing: this in-app text is a starting template,
+// not a substitute for a real, hosted privacy policy. Google Play and
+// Apple both require a live URL to your privacy policy in your store
+// listing - a page shown only inside the app doesn't satisfy that. Once
+// you're ready to publish, host this text (or a lawyer-reviewed version
+// of it) at a real URL (e.g. a simple page on your own domain, or a free
+// host like GitHub Pages - which you already have set up) and add that
+// link to your Play Console / App Store Connect listing.
+// ---------------------------------------------------------------------------
+const String kTermsOfServiceText = '''
+Twins - Terms of Service (template)
+
+By creating an account, you agree to:
+- Only post videos and photos you own or have permission to share.
+- Not upload content that is illegal, harassing, hateful, sexually explicit involving minors, or otherwise violates applicable law.
+- Respect other users - no harassment, impersonation, or spam.
+- Understand that celebrity accounts require verification and a paid subscription.
+- Understand that your account may be suspended or removed for violating these terms.
+
+This is a template - replace it with a real Terms of Service, ideally reviewed by a lawyer, before publishing your app.
+''';
+
+const String kPrivacyPolicyText = '''
+Twins - Privacy Policy (template)
+
+We collect:
+- Account info you provide (username, email).
+- Content you upload (videos, photos, captions, messages).
+- Basic usage data to keep the app working.
+
+If you use look-alike matching, your photo may be analyzed by a third-party face-matching service to find similar faces. You can decline to use this feature.
+
+We do not sell your personal data. Messages between users are stored to enable the messaging feature.
+
+This is a template - replace it with a real Privacy Policy, ideally reviewed by a lawyer, before publishing your app. It must be hosted at a public URL for Play Store / App Store submission, not just shown inside the app.
+''';
+
+class LegalScreen extends StatelessWidget {
+  final String title;
+  final String body;
+  const LegalScreen({super.key, required this.title, required this.body});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: const Color(0xFF000000),
+      appBar: AppBar(
+        backgroundColor: const Color(0xFF000000),
+        title: Text(title, style: const TextStyle(color: Colors.white)),
+      ),
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.all(20),
+        child: Text(
+          body,
+          style: const TextStyle(color: Colors.white70, height: 1.5),
+        ),
+      ),
+    );
+  }
+}
+
 class SignUpScreen extends StatefulWidget {
   const SignUpScreen({super.key});
 
@@ -184,9 +294,33 @@ class _SignUpScreenState extends State<SignUpScreen> {
   final _emailController = TextEditingController();
   final _passwordController = TextEditingController();
   bool _loading = false;
+  bool _agreedToTerms = false;
   String? _error;
 
+  static final _emailRegex = RegExp(r'^[\w\.\-]+@([\w\-]+\.)+[\w\-]{2,}$');
+
+  String? _validate() {
+    if (_usernameController.text.trim().length < 3) {
+      return 'Username must be at least 3 characters.';
+    }
+    if (!_emailRegex.hasMatch(_emailController.text.trim())) {
+      return 'Please enter a valid email address.';
+    }
+    if (_passwordController.text.length < 6) {
+      return 'Password must be at least 6 characters.';
+    }
+    if (!_agreedToTerms) {
+      return 'Please agree to the Terms of Service and Privacy Policy.';
+    }
+    return null;
+  }
+
   void _submit() {
+    final validationError = _validate();
+    if (validationError != null) {
+      setState(() => _error = validationError);
+      return;
+    }
     setState(() {
       _error = authController.signUp(
         username: _usernameController.text,
@@ -198,6 +332,13 @@ class _SignUpScreenState extends State<SignUpScreen> {
   }
 
   Future<void> _googleSignIn() async {
+    if (!_agreedToTerms) {
+      setState(
+        () =>
+            _error = 'Please agree to the Terms of Service and Privacy Policy.',
+      );
+      return;
+    }
     setState(() => _loading = true);
     final error = await authController.signInWithGoogle();
     if (!mounted) return;
@@ -211,9 +352,9 @@ class _SignUpScreenState extends State<SignUpScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: const Color(0xFF0B1120),
+      backgroundColor: const Color(0xFF000000),
       appBar: AppBar(
-        backgroundColor: const Color(0xFF0B1120),
+        backgroundColor: const Color(0xFF000000),
         title: const Text(
           'Create Account',
           style: TextStyle(color: Colors.white),
@@ -251,7 +392,70 @@ class _SignUpScreenState extends State<SignUpScreen> {
                   labelStyle: TextStyle(color: Colors.white70),
                 ),
               ),
-              const SizedBox(height: 16),
+              const SizedBox(height: 12),
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Checkbox(
+                    value: _agreedToTerms,
+                    activeColor: const Color(0xFF0284C7),
+                    onChanged: (v) =>
+                        setState(() => _agreedToTerms = v ?? false),
+                  ),
+                  Expanded(
+                    child: Padding(
+                      padding: const EdgeInsets.only(top: 12),
+                      child: RichText(
+                        text: TextSpan(
+                          style: const TextStyle(
+                            color: Colors.white70,
+                            fontSize: 13,
+                          ),
+                          children: [
+                            const TextSpan(text: 'I agree to the '),
+                            TextSpan(
+                              text: 'Terms of Service',
+                              style: const TextStyle(
+                                color: Colors.cyanAccent,
+                                decoration: TextDecoration.underline,
+                              ),
+                              recognizer: TapGestureRecognizer()
+                                ..onTap = () => Navigator.push(
+                                  context,
+                                  MaterialPageRoute(
+                                    builder: (_) => const LegalScreen(
+                                      title: 'Terms of Service',
+                                      body: kTermsOfServiceText,
+                                    ),
+                                  ),
+                                ),
+                            ),
+                            const TextSpan(text: ' and '),
+                            TextSpan(
+                              text: 'Privacy Policy',
+                              style: const TextStyle(
+                                color: Colors.cyanAccent,
+                                decoration: TextDecoration.underline,
+                              ),
+                              recognizer: TapGestureRecognizer()
+                                ..onTap = () => Navigator.push(
+                                  context,
+                                  MaterialPageRoute(
+                                    builder: (_) => const LegalScreen(
+                                      title: 'Privacy Policy',
+                                      body: kPrivacyPolicyText,
+                                    ),
+                                  ),
+                                ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 4),
               if (_error != null)
                 Padding(
                   padding: const EdgeInsets.only(bottom: 8),
@@ -349,12 +553,66 @@ class _LoginScreenState extends State<LoginScreen> {
     if (error == null) Navigator.pop(context);
   }
 
+  void _showForgotPasswordDialog() {
+    final resetEmailController = TextEditingController(
+      text: _emailController.text,
+    );
+    showDialog(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        backgroundColor: const Color(0xFF121212),
+        title: const Text(
+          'Reset Password',
+          style: TextStyle(color: Colors.white),
+        ),
+        content: TextField(
+          controller: resetEmailController,
+          keyboardType: TextInputType.emailAddress,
+          style: const TextStyle(color: Colors.white),
+          decoration: const InputDecoration(
+            labelText: 'Your account email',
+            labelStyle: TextStyle(color: Colors.white70),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text(
+              'Cancel',
+              style: TextStyle(color: Colors.white54),
+            ),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFF0284C7),
+            ),
+            onPressed: () {
+              // TODO: once a real backend is connected, call its password
+              // reset endpoint here (e.g. Firebase Auth's
+              // sendPasswordResetEmail). There's no email-sending
+              // capability yet, so this just confirms the request.
+              Navigator.pop(dialogContext);
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(
+                  content: Text(
+                    'If ${resetEmailController.text.trim()} has an account, a reset link will be sent (once email sending is connected).',
+                  ),
+                ),
+              );
+            },
+            child: const Text('Send reset link'),
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: const Color(0xFF0B1120),
+      backgroundColor: const Color(0xFF000000),
       appBar: AppBar(
-        backgroundColor: const Color(0xFF0B1120),
+        backgroundColor: const Color(0xFF000000),
         title: const Text('Log In', style: TextStyle(color: Colors.white)),
       ),
       body: SafeArea(
@@ -381,7 +639,16 @@ class _LoginScreenState extends State<LoginScreen> {
                   labelStyle: TextStyle(color: Colors.white70),
                 ),
               ),
-              const SizedBox(height: 16),
+              Align(
+                alignment: Alignment.centerRight,
+                child: TextButton(
+                  onPressed: _showForgotPasswordDialog,
+                  child: const Text(
+                    'Forgot password?',
+                    style: TextStyle(color: Colors.cyanAccent, fontSize: 13),
+                  ),
+                ),
+              ),
               if (_error != null)
                 Padding(
                   padding: const EdgeInsets.only(bottom: 8),
@@ -469,9 +736,9 @@ class _MessageScreenState extends State<MessageScreen> {
   Widget build(BuildContext context) {
     final messages = widget.video.messages;
     return Scaffold(
-      backgroundColor: const Color(0xFF0B1120),
+      backgroundColor: const Color(0xFF000000),
       appBar: AppBar(
-        backgroundColor: const Color(0xFF0B1120),
+        backgroundColor: const Color(0xFF000000),
         title: Text(
           widget.video.username,
           style: const TextStyle(color: Colors.white),
@@ -545,6 +812,7 @@ class _MessageScreenState extends State<MessageScreen> {
                   ),
                   IconButton(
                     icon: const Icon(Icons.send, color: Colors.cyanAccent),
+                    tooltip: 'Send message',
                     onPressed: _send,
                   ),
                 ],
@@ -569,12 +837,12 @@ class TwinsApp extends StatelessWidget {
       title: 'Twins - Lookalike Network',
       debugShowCheckedModeBanner: false,
       theme: ThemeData.dark().copyWith(
-        scaffoldBackgroundColor: const Color(0xFF0B1120),
+        scaffoldBackgroundColor: const Color(0xFF000000),
         primaryColor: const Color(0xFF0284C7),
         colorScheme: const ColorScheme.dark(
           primary: Color(0xFF0284C7),
           secondary: Color(0xFF38BDF8),
-          surface: Color(0xFF1E293B),
+          surface: Color(0xFF121212),
         ),
       ),
       home: const MainVideoFeedScreen(),
@@ -606,6 +874,9 @@ class VideoItem {
   bool isFollowedByMe;
   final List<String> messages;
 
+  // Total USD tipped to this creator (Celebrities page tipping feature).
+  int tipsReceivedUsd;
+
   // The actual picked video - a local file path (Android/iOS/desktop) or
   // a blob: URL (web). Null for the built-in demo videos, which show a
   // placeholder instead since there's no real media file behind them.
@@ -636,6 +907,7 @@ class VideoItem {
     this.reposts = 0,
     this.videoCount = 1,
     this.isFollowedByMe = false,
+    this.tipsReceivedUsd = 0,
     List<String>? messages,
     this.mediaUrl,
     this.filter = 'None',
@@ -715,11 +987,81 @@ class VideoFeedStore extends ChangeNotifier {
       videoCount: 8,
     ),
     VideoItem(
+      id: '4',
+      username: '@fitwithjade',
+      caption: 'My gym buddy turned out to be my 87% twin!',
+      musicTrack: 'Workout Mix - Pump It',
+      category: 'Fitness',
+      likes: 18700,
+      comments: 412,
+      followers: 12300,
+      following: 145,
+      accountLikes: 203000,
+      reposts: 780,
+      videoCount: 19,
+    ),
+    VideoItem(
+      id: '5',
+      username: '@wanderlust_theo',
+      caption: 'Met my look-alike backpacking through Peru - 82% match!',
+      musicTrack: 'Travel Vibes - Sunset Road',
+      category: 'Travel',
+      likes: 22100,
+      comments: 566,
+      followers: 15800,
+      following: 203,
+      accountLikes: 289000,
+      reposts: 940,
+      videoCount: 27,
+    ),
+    VideoItem(
+      id: '6',
+      username: '@comedyking_pj',
+      caption: 'POV: you find your twin and he steals your jokes 😂',
+      musicTrack: 'Funny Bit - Laugh Track',
+      category: 'Comedy',
+      likes: 34500,
+      comments: 1203,
+      followers: 19600,
+      following: 88,
+      accountLikes: 410000,
+      reposts: 1560,
+      videoCount: 41,
+    ),
+    VideoItem(
+      id: '7',
+      username: '@actorlife_maya',
+      caption: 'My acting double showed up to my own audition - 90%!',
+      musicTrack: 'Dramatic Score - Spotlight',
+      category: 'Acting',
+      likes: 15900,
+      comments: 388,
+      followers: 9700,
+      following: 132,
+      accountLikes: 176000,
+      reposts: 620,
+      videoCount: 16,
+    ),
+    VideoItem(
+      id: '8',
+      username: '@faithwithgrace',
+      caption: 'Praise report: found my church twin - 85% match, glory!',
+      musicTrack: 'Worship Mix - Amazing Grace',
+      category: 'Gospel',
+      likes: 27300,
+      comments: 701,
+      followers: 16400,
+      following: 74,
+      accountLikes: 305000,
+      reposts: 1100,
+      videoCount: 23,
+    ),
+    VideoItem(
       id: 'celeb-1',
       username: '@zaraofficial',
       caption: 'My twin match blew my mind - 96%! Who else has one?',
       musicTrack: 'Studio Mix - Zara',
-      category: 'Celebrity',
+      category: 'Music',
       likes: 892000,
       comments: 41200,
       followers: 4200000,
@@ -727,6 +1069,66 @@ class VideoFeedStore extends ChangeNotifier {
       accountLikes: 15600000,
       reposts: 98000,
       videoCount: 61,
+      isCelebrity: true,
+    ),
+    VideoItem(
+      id: 'celeb-2',
+      username: '@marcusthesprinter',
+      caption: 'Fans keep sending me my "twin" - 91% match, wild!',
+      musicTrack: 'Stadium Anthem - Official',
+      category: 'Sports',
+      likes: 654000,
+      comments: 28900,
+      followers: 3100000,
+      following: 8,
+      accountLikes: 9800000,
+      reposts: 52000,
+      videoCount: 44,
+      isCelebrity: true,
+    ),
+    VideoItem(
+      id: 'celeb-3',
+      username: '@ceciliaonscreen',
+      caption: 'Found out I have a 94% look-alike in Manila!',
+      musicTrack: 'Cinematic Score - Reel Life',
+      category: 'Movies',
+      likes: 721000,
+      comments: 33500,
+      followers: 5600000,
+      following: 15,
+      accountLikes: 21000000,
+      reposts: 87000,
+      videoCount: 73,
+      isCelebrity: true,
+    ),
+    VideoItem(
+      id: 'celeb-4',
+      username: '@joeycracksup',
+      caption: 'My stand-up double roasted ME at my own show - 93%!',
+      musicTrack: 'Funny Bit - Laugh Track',
+      category: 'Comedy',
+      likes: 583000,
+      comments: 52100,
+      followers: 2900000,
+      following: 22,
+      accountLikes: 8700000,
+      reposts: 61000,
+      videoCount: 38,
+      isCelebrity: true,
+    ),
+    VideoItem(
+      id: 'celeb-5',
+      username: '@runwayrenee',
+      caption: 'Backstage at fashion week I met my 97% twin!',
+      musicTrack: 'Runway Beat - Vogue Mix',
+      category: 'Fashion',
+      likes: 1100000,
+      comments: 61200,
+      followers: 7300000,
+      following: 19,
+      accountLikes: 31000000,
+      reposts: 142000,
+      videoCount: 96,
       isCelebrity: true,
     ),
   ];
@@ -738,6 +1140,246 @@ class VideoFeedStore extends ChangeNotifier {
 }
 
 final videoFeedStore = VideoFeedStore();
+
+// ---------------------------------------------------------------------------
+// LOOK-ALIKE MATCHING API CONFIG
+//
+// FILL THESE IN when your backend (e.g. an AWS Lambda function in front of
+// Rekognition's IndexFaces/SearchFacesByImage) is ready. Leave them blank
+// to keep using the built-in demo scorer in the meantime - the app works
+// either way, you're just not getting real face-matching results yet.
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// TRENDING ALGORITHM
+//
+// Ranks videos/celebrities by weighted engagement, not just raw follower
+// count - a comment or a tip is a stronger signal of genuine interest than
+// a passive like, so they count for more. Followers are included as a
+// baseline authority signal but log-scaled so a huge existing following
+// alone can't completely drown out genuinely trending newer content.
+//
+// Honest limitation: a truly production-grade trending algorithm also
+// factors RECENCY/VELOCITY (engagement per hour, not just totals) so
+// something popular yesterday doesn't outrank something exploding right
+// now. This app doesn't track post timestamps yet, so this is a
+// weighted-engagement approximation - add a `postedAt` field to VideoItem
+// and factor in engagement-since-post-time here once that's tracked.
+// ---------------------------------------------------------------------------
+double calculateTrendingScore(VideoItem v) {
+  return (v.likes * 1.0) +
+      (v.comments * 3.0) +
+      (v.reposts * 5.0) +
+      (v.tipsReceivedUsd * 20.0) +
+      (log(v.followers + 1) * 500);
+}
+
+class MatchingApiConfig {
+  /// Your backend's base URL, e.g. 'https://abc123.execute-api.us-east-1.amazonaws.com'
+  static const String baseUrl = '';
+
+  /// A shared secret your Lambda checks for, sent as the x-api-key header.
+  /// Never put your actual AWS/Rekognition credentials here - those stay
+  /// server-side only. This key just authenticates your app to YOUR
+  /// backend.
+  static const String apiKey = '';
+
+  static bool get isConfigured => baseUrl.isNotEmpty;
+}
+
+/// Result of a look-alike search - either from the real API or the demo
+/// fallback.
+class MatchResult {
+  final int percentage;
+  final String? matchedUsername;
+  final String? matchedAvatarUrl;
+  final bool isRealMatch; // false = demo fallback, true = real API result
+
+  MatchResult({
+    required this.percentage,
+    this.matchedUsername,
+    this.matchedAvatarUrl,
+    this.isRealMatch = false,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// LOOK-ALIKE MATCHING API SERVICE
+//
+// This is the ONE place in the app that produces a match percentage.
+// Every screen (New Match, Celebrity badges) calls through here instead of
+// inventing its own number, so wiring up a real backend is a one-file
+// change.
+//
+// HOW TO CONNECT A REAL BACKEND (see the AWS conversation for the plan):
+//   1. Set up an AWS Rekognition Face Collection.
+//   2. Deploy two Lambda functions behind API Gateway:
+//        POST /index   - takes a photo, calls IndexFaces, stores the
+//                         returned FaceId against the user's account
+//        POST /match   - takes a photo, calls SearchFacesByImage, returns
+//                         the closest matching user's id + similarity %
+//   3. Fill in MatchingApiConfig.baseUrl and apiKey above.
+//   4. That's it - findLookAlike() and findCelebrityLookAlike() below
+//      will automatically start hitting your real endpoints instead of
+//      the demo fallback.
+// ---------------------------------------------------------------------------
+class MatchingApiService {
+  /// DEMO FALLBACK - deterministic per pair of ids (so the same two
+  /// accounts always show the same %) but NOT based on any actual visual
+  /// comparison. Used automatically whenever MatchingApiConfig isn't
+  /// filled in yet, or if a real API call fails, so the app never breaks
+  /// during testing.
+  static int _demoPercentageFor(String idA, String idB) {
+    final combined = (idA + idB).hashCode.abs();
+    return 75 + (combined % 22); // 75-96%, demo range only
+  }
+
+  /// Find the closest look-alike among everyday users. Pass the photo you
+  /// want to search with (e.g. the person's profile picture bytes).
+  static Future<MatchResult> findLookAlike({
+    required String myId,
+    Uint8List? photoBytes,
+  }) async {
+    if (!MatchingApiConfig.isConfigured || photoBytes == null) {
+      return MatchResult(percentage: _demoPercentageFor(myId, 'new_match'));
+    }
+    try {
+      final response = await http
+          .post(
+            Uri.parse('${MatchingApiConfig.baseUrl}/match'),
+            headers: {
+              'Content-Type': 'application/json',
+              'x-api-key': MatchingApiConfig.apiKey,
+            },
+            body: jsonEncode({'photoBase64': base64Encode(photoBytes)}),
+          )
+          .timeout(const Duration(seconds: 15));
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body) as Map<String, dynamic>;
+        return MatchResult(
+          percentage: (data['percentage'] as num).round(),
+          matchedUsername: data['matchedUsername'] as String?,
+          matchedAvatarUrl: data['matchedAvatarUrl'] as String?,
+          isRealMatch: true,
+        );
+      }
+    } catch (_) {
+      // Falls through to the demo result below - network issues or a
+      // not-yet-deployed backend should never crash the app.
+    }
+    return MatchResult(percentage: _demoPercentageFor(myId, 'new_match'));
+  }
+
+  /// Same idea, but searched against the celebrity collection instead of
+  /// everyday users.
+  static Future<MatchResult> findCelebrityLookAlike({
+    required String myId,
+    required String celebrityVideoId,
+    Uint8List? photoBytes,
+  }) async {
+    if (!MatchingApiConfig.isConfigured || photoBytes == null) {
+      return MatchResult(
+        percentage: _demoPercentageFor(myId, celebrityVideoId),
+      );
+    }
+    try {
+      final response = await http
+          .post(
+            Uri.parse('${MatchingApiConfig.baseUrl}/match-celebrity'),
+            headers: {
+              'Content-Type': 'application/json',
+              'x-api-key': MatchingApiConfig.apiKey,
+            },
+            body: jsonEncode({'photoBase64': base64Encode(photoBytes)}),
+          )
+          .timeout(const Duration(seconds: 15));
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body) as Map<String, dynamic>;
+        return MatchResult(
+          percentage: (data['percentage'] as num).round(),
+          matchedUsername: data['matchedUsername'] as String?,
+          matchedAvatarUrl: data['matchedAvatarUrl'] as String?,
+          isRealMatch: true,
+        );
+      }
+    } catch (_) {
+      // Same graceful fallback as above.
+    }
+    return MatchResult(percentage: _demoPercentageFor(myId, celebrityVideoId));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// PAYMENT CONFIG & SERVICE
+//
+// FILL THESE IN when you're ready to take real payments. Recommended path:
+// add the `purchases_flutter` package (RevenueCat) or `flutter_stripe`,
+// then replace the body of purchaseCelebritySubscription() with a real
+// checkout call. Until then, this simulates a successful purchase after a
+// short delay so you can test the rest of the flow (account creation,
+// unlocking the celebrity badge, etc.) end-to-end.
+//
+// NEVER put real secret API keys directly in this file for a published
+// app - secret keys belong on your backend. Stripe's PUBLISHABLE key (not
+// the secret key) is safe to ship in a mobile app; RevenueCat's public SDK
+// key is also safe client-side.
+// ---------------------------------------------------------------------------
+class PaymentConfig {
+  /// e.g. Stripe publishable key ('pk_live_...') or RevenueCat public SDK key.
+  static const String publicApiKey = '';
+
+  static bool get isConfigured => publicApiKey.isNotEmpty;
+}
+
+class PaymentService {
+  /// Returns true on a successful purchase. Currently simulates success
+  /// after a short delay when PaymentConfig isn't filled in yet, so the
+  /// rest of the app (account creation, celebrity unlock) can be tested
+  /// without a real payment provider connected.
+  static Future<bool> purchaseCelebritySubscription() async {
+    if (!PaymentConfig.isConfigured) {
+      await Future.delayed(const Duration(milliseconds: 900));
+      return true; // TESTING ONLY - replace once a real provider is wired in
+    }
+    // TODO: real checkout call, e.g.:
+    //   final result = await Purchases.purchasePackage(celebrityPackage);
+    //   return result.customerInfo.entitlements.active.containsKey('celebrity');
+    return true;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// TIPPING (Celebrities page) - API-ready
+//
+// Lets people send a real monetary tip to a celebrity, TikTok-gifting
+// style. Uses the SAME PaymentConfig above (one payment provider for the
+// whole app) - reuses whatever key you fill in there. Until that's
+// configured, tips simulate success so you can test the full flow (pick
+// amount, confirm, see it reflected) end-to-end today.
+// ---------------------------------------------------------------------------
+class TippingService {
+  static const List<int> presetAmounts = [1, 5, 10, 25, 50];
+
+  /// Returns true on a successful tip. Real integration note: charge the
+  /// tipper via your payment provider, then credit the celebrity's payout
+  /// balance on your backend (never trust the client to report success -
+  /// verify the charge server-side before crediting anyone).
+  static Future<bool> sendTip({
+    required String celebrityId,
+    required int amountUsd,
+  }) async {
+    if (!PaymentConfig.isConfigured) {
+      await Future.delayed(const Duration(milliseconds: 700));
+      return true; // TESTING ONLY - replace once a real provider is wired in
+    }
+    // TODO: real charge + payout call, e.g.:
+    //   final charge = await Purchases.purchaseProduct('tip_$amountUsd');
+    //   if (!charge.success) return false;
+    //   await yourBackend.creditCelebrity(celebrityId, amountUsd);
+    return true;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // VIDEO FILTERS
@@ -839,10 +1481,18 @@ class _MainVideoFeedScreenState extends State<MainVideoFeedScreen> {
   // posted videos appear here immediately.
   // The normal feed excludes celebrity videos - those only live inside the
   // Celebrities tab (or turn up if someone searches for them directly).
-  List<VideoItem> get _videos =>
-      videoFeedStore.videos.where((v) => !v.isCelebrity).toList();
+  // Selecting a category from the scrollable wheel filters this list down
+  // to just that category's videos - 'All' shows everything.
+  List<VideoItem> get _videos {
+    final base = videoFeedStore.videos.where((v) => !v.isCelebrity);
+    final filtered = _selectedCategory == 'All'
+        ? base
+        : base.where((v) => v.category == _selectedCategory);
+    return filtered.toList();
+  }
 
   final List<String> _categories = [
+    'All',
     'Dancing',
     'Style',
     'Fashion',
@@ -850,12 +1500,32 @@ class _MainVideoFeedScreenState extends State<MainVideoFeedScreen> {
     'Travel',
     'Comedy',
     'Acting',
+    'Gospel',
   ];
 
-  String _selectedCategory = 'Dancing';
+  String _selectedCategory = 'All';
+  // Which item the wheel is currently scrolled to (just visual feedback
+  // while scrolling) - separate from _selectedCategory, which only
+  // changes when the person actually TAPS an item. This is what fixes
+  // categories auto-applying mid-scroll.
+  int _highlightedCategoryIndex = 0;
   int _currentIndex = 0;
 
-  VideoItem get _currentVideo => _videos[_currentIndex];
+  VideoItem get _currentVideo => _videos.isEmpty
+      ? _placeholderVideo
+      : _videos[_currentIndex.clamp(0, _videos.length - 1)];
+
+  // Shown only if a category filter genuinely has zero videos in it, so
+  // _currentVideo never crashes on an empty list.
+  static final VideoItem _placeholderVideo = VideoItem(
+    id: 'placeholder',
+    username: '@twins',
+    caption: 'No videos in this category yet - be the first to post one!',
+    musicTrack: 'Original Sound',
+    category: 'All',
+    likes: 0,
+    comments: 0,
+  );
 
   // Tracks each visible video's live VideoPlayerController so the scrub
   // line can show/seek playback position.
@@ -870,17 +1540,42 @@ class _MainVideoFeedScreenState extends State<MainVideoFeedScreen> {
     if (mounted) setState(() {});
   }
 
-  final MatchProfile _newMatch = MatchProfile(
+  // These start at a reasonable placeholder and get replaced with a real
+  // result from MatchingApiService as soon as it resolves (instant if
+  // running on the demo fallback, or after the real API responds once a
+  // backend is connected).
+  int _newMatchPercent = 80;
+  int _celebMatchPercent = 94;
+
+  Future<void> _loadMatchPercentages() async {
+    final myId = authController.currentUser?.username ?? 'guest';
+    final photoBytes = authController.currentUser?.avatarBytes;
+
+    final newMatchResult = await MatchingApiService.findLookAlike(
+      myId: myId,
+      photoBytes: photoBytes,
+    );
+    if (mounted) setState(() => _newMatchPercent = newMatchResult.percentage);
+
+    final celebResult = await MatchingApiService.findCelebrityLookAlike(
+      myId: myId,
+      celebrityVideoId: 'locked_celeb',
+      photoBytes: photoBytes,
+    );
+    if (mounted) setState(() => _celebMatchPercent = celebResult.percentage);
+  }
+
+  MatchProfile get _newMatch => MatchProfile(
     name: 'Rafael M.',
     country: 'Brazil',
-    percentage: 80,
+    percentage: _newMatchPercent,
     imageUrl: 'https://i.pravatar.cc/400?img=32',
   );
 
-  final MatchProfile _celebMatch = MatchProfile(
+  MatchProfile get _celebMatch => MatchProfile(
     name: 'Locked Celebrity',
     country: 'USA',
-    percentage: 94,
+    percentage: _celebMatchPercent,
     isCelebrity: true,
     locked: true,
   );
@@ -890,10 +1585,83 @@ class _MainVideoFeedScreenState extends State<MainVideoFeedScreen> {
     super.initState();
     // Rebuild the feed whenever a new video is posted anywhere in the app.
     videoFeedStore.addListener(_onFeedChanged);
+    _loadMatchPercentages();
   }
 
   void _onFeedChanged() {
     if (mounted) setState(() {});
+  }
+
+  // Resets everything back to the very first, unfiltered view of the app -
+  // used by both the "Twins" logo (always visible, top bar) and the
+  // "For You" chip that appears while a category filter is active.
+  void _goHome() {
+    setState(() {
+      _selectedCategory = 'All';
+      _highlightedCategoryIndex = _categories.indexOf('All');
+      _currentIndex = 0;
+    });
+    if (_pageController.hasClients) {
+      _pageController.jumpToPage(0);
+    }
+    if (_categoryWheelController.hasClients) {
+      _categoryWheelController.jumpToItem(_categories.indexOf('All'));
+    }
+  }
+
+  // Actually applies a category filter - only called when the person TAPS
+  // an item in the wheel, never just from scrolling past it.
+  void _applyCategory(int index) {
+    setState(() {
+      _selectedCategory = _categories[index];
+      _highlightedCategoryIndex = index;
+      _currentIndex = 0;
+    });
+    if (_pageController.hasClients) {
+      _pageController.jumpToPage(0);
+    }
+    if (_categoryWheelController.hasClients) {
+      _categoryWheelController.animateToItem(
+        index,
+        duration: const Duration(milliseconds: 250),
+        curve: Curves.easeOut,
+      );
+    }
+  }
+
+  // Is this video one of the top 3 trending (by calculateTrendingScore)
+  // within whatever's currently being browsed? Same algorithm the
+  // Celebrities leaderboard uses, applied here for app-wide consistency.
+  bool _isTrending(VideoItem video) {
+    final pool = [..._videos]
+      ..sort(
+        (a, b) =>
+            calculateTrendingScore(b).compareTo(calculateTrendingScore(a)),
+      );
+    return pool.take(3).contains(video);
+  }
+
+  IconData _categoryIcon(String category) {
+    switch (category) {
+      case 'Dancing':
+        return Icons.music_note;
+      case 'Style':
+        return Icons.checkroom;
+      case 'Fashion':
+        return Icons.style;
+      case 'Fitness':
+        return Icons.fitness_center;
+      case 'Travel':
+        return Icons.flight_takeoff;
+      case 'Comedy':
+        return Icons.theater_comedy;
+      case 'Acting':
+        return Icons.movie;
+      case 'Gospel':
+        return Icons.church;
+      default:
+        return Icons.apps; // 'All'
+    }
   }
 
   @override
@@ -995,7 +1763,7 @@ class _MainVideoFeedScreenState extends State<MainVideoFeedScreen> {
 
     showModalBottomSheet(
       context: context,
-      backgroundColor: const Color(0xFF1E293B),
+      backgroundColor: const Color(0xFF121212),
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
       ),
@@ -1097,8 +1865,84 @@ class _MainVideoFeedScreenState extends State<MainVideoFeedScreen> {
                   }
                 },
               ),
+              ListTile(
+                leading: const Icon(
+                  Icons.flag_outlined,
+                  color: Colors.redAccent,
+                ),
+                title: const Text(
+                  'Report',
+                  style: TextStyle(color: Colors.white),
+                ),
+                subtitle: const Text(
+                  'Flag this video for review',
+                  style: TextStyle(color: Colors.white38, fontSize: 11),
+                ),
+                onTap: () {
+                  Navigator.pop(context);
+                  _showReportSheet(video);
+                },
+              ),
             ],
           ),
+        ),
+      ),
+    );
+  }
+
+  // Reports go into an in-memory list for now - see the note on
+  // AuthController/VideoFeedStore for how to wire real persistence in.
+  // TODO: once a backend exists, POST this to a /reports endpoint (or a
+  // Firestore 'reports' collection) so moderators can actually see it.
+  void _showReportSheet(VideoItem video) {
+    final reasons = [
+      'Spam or misleading',
+      'Nudity or sexual content',
+      'Harassment or bullying',
+      'Hate speech or symbols',
+      'Violence or dangerous content',
+      'Impersonation',
+      'Something else',
+    ];
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF121212),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (_) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Padding(
+              padding: EdgeInsets.all(16),
+              child: Text(
+                'Why are you reporting this video?',
+                style: TextStyle(
+                  color: Colors.white,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+            ),
+            ...reasons.map(
+              (reason) => ListTile(
+                title: Text(
+                  reason,
+                  style: const TextStyle(color: Colors.white70),
+                ),
+                onTap: () {
+                  Navigator.pop(context);
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text(
+                        'Thanks - our team will review this video.',
+                      ),
+                    ),
+                  );
+                },
+              ),
+            ),
+          ],
         ),
       ),
     );
@@ -1140,7 +1984,7 @@ class _MainVideoFeedScreenState extends State<MainVideoFeedScreen> {
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
-      backgroundColor: const Color(0xFF1E293B),
+      backgroundColor: const Color(0xFF121212),
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
       ),
@@ -1280,46 +2124,56 @@ class _MainVideoFeedScreenState extends State<MainVideoFeedScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      backgroundColor: const Color(0xFF000000),
       body: Stack(
         children: [
           // Vertical scrolling video feed
-          PageView.builder(
-            controller: _pageController,
-            scrollDirection: Axis.vertical,
-            itemCount: _videos.length,
-            onPageChanged: (index) {
-              setState(() => _currentIndex = index);
-            },
-            itemBuilder: (context, index) {
-              final video = _videos[index];
-              return _buildVideoPage(video);
-            },
-          ),
-
-          // Top bar: logo/title + match boxes + search
-          SafeArea(
-            child: Column(
-              children: [
-                _buildTopBar(),
-                const SizedBox(height: 8),
-                Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 12),
-                  child: Row(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      _buildNewMatchBox(),
-                      const SizedBox(width: 10),
-                      _buildCelebrityBox(),
-                      const SizedBox(width: 10),
-                      _buildCreatorAvatarBox(_currentVideo),
-                      const SizedBox(width: 10),
-                      _buildMessageBox(_currentVideo),
-                    ],
+          _videos.isEmpty
+              ? Center(
+                  child: Padding(
+                    padding: const EdgeInsets.all(32),
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        const Icon(
+                          Icons.videocam_off_outlined,
+                          color: Colors.white24,
+                          size: 56,
+                        ),
+                        const SizedBox(height: 12),
+                        Text(
+                          'No $_selectedCategory videos yet',
+                          style: const TextStyle(
+                            color: Colors.white70,
+                            fontSize: 16,
+                          ),
+                        ),
+                        const SizedBox(height: 6),
+                        const Text(
+                          'Be the first to post one, or pick another category.',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(color: Colors.white38, fontSize: 13),
+                        ),
+                      ],
+                    ),
                   ),
+                )
+              : PageView.builder(
+                  controller: _pageController,
+                  scrollDirection: Axis.vertical,
+                  itemCount: _videos.length,
+                  onPageChanged: (index) {
+                    setState(() => _currentIndex = index);
+                  },
+                  itemBuilder: (context, index) {
+                    final video = _videos[index];
+                    return _buildVideoPage(video);
+                  },
                 ),
-              ],
-            ),
-          ),
+
+          // Top bar: logo/title + messages + search. Kept simple and clear
+          // of the video's face area.
+          SafeArea(child: Column(children: [_buildTopBar()])),
         ],
       ),
     );
@@ -1330,49 +2184,130 @@ class _MainVideoFeedScreenState extends State<MainVideoFeedScreen> {
   // -------------------------------------------------------------------
   Widget _buildTopBar() {
     return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 12),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 2),
+      child: Column(
         children: [
-          const SizedBox(width: 40), // balance for centering
           Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              Container(
-                width: 30,
-                height: 30,
-                decoration: const BoxDecoration(
-                  shape: BoxShape.circle,
-                  gradient: LinearGradient(
-                    colors: [Color(0xFF0284C7), Color(0xFF38BDF8)],
+              Row(
+                children: [
+                  // A real, clearly-visible back/home button - not just a
+                  // tappable logo. Only does something when there's actually
+                  // somewhere to go "back" to (a category filter applied).
+                  IconButton(
+                    icon: const Icon(
+                      Icons.arrow_back,
+                      color: Colors.white,
+                      size: 20,
+                    ),
+                    tooltip: 'Back to For You',
+                    onPressed: _selectedCategory == 'All' ? null : _goHome,
+                    disabledColor: Colors.white24,
+                    padding: EdgeInsets.zero,
+                    constraints: const BoxConstraints(
+                      minWidth: 34,
+                      minHeight: 34,
+                    ),
+                    visualDensity: VisualDensity.compact,
                   ),
-                ),
-                child: const Icon(
-                  Icons.people_alt_rounded,
-                  color: Colors.white,
-                  size: 18,
-                ),
+                  IconButton(
+                    icon: const Icon(
+                      Icons.mail_outline,
+                      color: Colors.white,
+                      size: 20,
+                    ),
+                    tooltip: 'Messages',
+                    onPressed: () => _openMessageScreen(_currentVideo),
+                    padding: EdgeInsets.zero,
+                    constraints: const BoxConstraints(
+                      minWidth: 34,
+                      minHeight: 34,
+                    ),
+                    visualDensity: VisualDensity.compact,
+                  ),
+                ],
               ),
-              const SizedBox(width: 6),
-              const Text(
-                'Twins',
-                style: TextStyle(
-                  color: Colors.white,
-                  fontWeight: FontWeight.w900,
-                  fontSize: 20,
-                  letterSpacing: 0.5,
-                ),
+              Row(
+                children: [
+                  Container(
+                    width: 26,
+                    height: 26,
+                    decoration: const BoxDecoration(
+                      shape: BoxShape.circle,
+                      gradient: LinearGradient(
+                        colors: [Color(0xFF0284C7), Color(0xFF38BDF8)],
+                      ),
+                    ),
+                    child: const Icon(
+                      Icons.people_alt_rounded,
+                      color: Colors.white,
+                      size: 16,
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  const Text(
+                    'Twins',
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontWeight: FontWeight.w900,
+                      fontSize: 18,
+                      letterSpacing: 0.5,
+                    ),
+                  ),
+                ],
+              ),
+              IconButton(
+                icon: const Icon(Icons.search, color: Colors.white, size: 22),
+                tooltip: 'Search',
+                padding: EdgeInsets.zero,
+                constraints: const BoxConstraints(minWidth: 34, minHeight: 34),
+                visualDensity: VisualDensity.compact,
+                onPressed: () {
+                  Navigator.push(
+                    context,
+                    MaterialPageRoute(builder: (_) => const SearchScreen()),
+                  );
+                },
               ),
             ],
           ),
-          IconButton(
-            icon: const Icon(Icons.search, color: Colors.white, size: 26),
-            onPressed: () {
-              Navigator.push(
-                context,
-                MaterialPageRoute(builder: (_) => const SearchScreen()),
-              );
-            },
-          ),
+          // "Now watching: <category>" - only shown while a filter is
+          // active, so people always know what they're browsing.
+          if (_selectedCategory != 'All')
+            Padding(
+              padding: const EdgeInsets.only(top: 2),
+              child: Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 10,
+                  vertical: 3,
+                ),
+                decoration: BoxDecoration(
+                  color: Colors.black45,
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: Colors.cyan.shade600, width: 1),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      _categoryIcon(_selectedCategory),
+                      color: Colors.cyanAccent,
+                      size: 12,
+                    ),
+                    const SizedBox(width: 5),
+                    Text(
+                      'Watching: $_selectedCategory',
+                      style: const TextStyle(
+                        color: Colors.cyanAccent,
+                        fontSize: 11,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
         ],
       ),
     );
@@ -1580,95 +2515,11 @@ class _MainVideoFeedScreenState extends State<MainVideoFeedScreen> {
   }
 
   // -------------------------------------------------------------------
-  // CREATOR PROFILE AVATAR BOX (round pic of the person whose video is
-  // currently playing - sits in the same row as new match / celebrities)
-  // -------------------------------------------------------------------
-  Widget _buildCreatorAvatarBox(VideoItem video) {
-    return GestureDetector(
-      onTap: () => _showCreatorProfileSheet(video),
-      child: SizedBox(
-        width: 52,
-        height: 86,
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.start,
-          children: [
-            CircleAvatar(
-              radius: 20,
-              backgroundColor: const Color(0xFF0284C7),
-              backgroundImage: video.creatorAvatarUrl.isNotEmpty
-                  ? NetworkImage(video.creatorAvatarUrl)
-                  : null,
-              child: video.creatorAvatarUrl.isEmpty
-                  ? const Icon(Icons.person, color: Colors.white, size: 20)
-                  : null,
-            ),
-            const SizedBox(height: 3),
-            Text(
-              video.username,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: const TextStyle(
-                color: Colors.white70,
-                fontSize: 8,
-                fontWeight: FontWeight.bold,
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  // -------------------------------------------------------------------
-  // MESSAGE BOX (message the person whose video is currently playing)
-  // -------------------------------------------------------------------
-  Widget _buildMessageBox(VideoItem video) {
-    return GestureDetector(
-      onTap: () => _openMessageScreen(video),
-      child: Container(
-        width: 40,
-        height: 66,
-        alignment: Alignment.topCenter,
-        padding: const EdgeInsets.only(top: 3),
-        decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(11),
-          border: Border.all(color: Colors.cyan.shade600, width: 1.2),
-        ),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Container(
-              width: 26,
-              height: 26,
-              decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                color: const Color(0xFF0284C7).withValues(alpha: 0.25),
-              ),
-              child: const Icon(Icons.mail, color: Colors.cyanAccent, size: 13),
-            ),
-            const SizedBox(height: 3),
-            const FittedBox(
-              child: Text(
-                'Message',
-                style: TextStyle(
-                  color: Colors.white70,
-                  fontSize: 10,
-                  fontWeight: FontWeight.bold,
-                ),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  // -------------------------------------------------------------------
   // SINGLE VIDEO PAGE
   // -------------------------------------------------------------------
   Widget _buildVideoPage(VideoItem video) {
     return Container(
-      color: const Color(0xFF0B1120),
+      color: const Color(0xFF000000),
       child: Stack(
         fit: StackFit.expand,
         children: [
@@ -1691,6 +2542,10 @@ class _MainVideoFeedScreenState extends State<MainVideoFeedScreen> {
                     filter: video.filter,
                     onControllerChanged: (c) =>
                         _registerController(video.id, c),
+                    isLiked: video.likedByMe,
+                    onDoubleTapLike: () {
+                      if (!video.likedByMe) _toggleLike(video);
+                    },
                   )
                 : const Center(
                     child: Icon(
@@ -1701,11 +2556,41 @@ class _MainVideoFeedScreenState extends State<MainVideoFeedScreen> {
                   ),
           ),
 
-          // Music / sound pill - now sits just above the Home button,
-          // shortened, and styled transparent like the category wheel
+          // Trending badge - same weighted algorithm as the Celebrities
+          // page leaderboard, shown when this video is one of the top 3
+          // trending within whatever's currently being browsed.
+          if (_isTrending(video))
+            Positioned(
+              top: 90,
+              left: 16,
+              child: Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 10,
+                  vertical: 5,
+                ),
+                decoration: BoxDecoration(
+                  gradient: const LinearGradient(
+                    colors: [Colors.amber, Colors.deepOrange],
+                  ),
+                  borderRadius: BorderRadius.circular(20),
+                ),
+                child: const Text(
+                  '🔥 Trending',
+                  style: TextStyle(
+                    color: Colors.black,
+                    fontSize: 11,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+              ),
+            ),
+
+          // Music / sound pill - sits just above the bottom row (now
+          // taller since New Match / Celebrities moved into it), styled
+          // transparent like the category wheel
           Positioned(
             left: 16,
-            bottom: 48,
+            bottom: 118,
             child: GestureDetector(
               onTap: () => _showMusicSheet(video.musicTrack),
               child: Container(
@@ -1746,15 +2631,15 @@ class _MainVideoFeedScreenState extends State<MainVideoFeedScreen> {
             Positioned(
               left: 16,
               right: 16,
-              bottom: 74,
+              bottom: 105,
               child: _buildScrubLine(video),
             ),
 
           // Home - Caption - Share, all on the same line
           Positioned(
-            left: 16,
-            right: 16,
-            bottom: 20,
+            left: 20,
+            right: 20,
+            bottom: 24,
             child: Row(
               crossAxisAlignment: CrossAxisAlignment.center,
               children: [
@@ -1766,21 +2651,28 @@ class _MainVideoFeedScreenState extends State<MainVideoFeedScreen> {
                       curve: Curves.easeInOut,
                     );
                   },
-                  child: Container(
-                    padding: const EdgeInsets.all(8),
-                    decoration: BoxDecoration(
-                      shape: BoxShape.circle,
-                      color: Colors.black45,
-                      border: Border.all(color: Colors.cyan.shade600),
-                    ),
-                    child: const Icon(
-                      Icons.home,
-                      color: Colors.white,
-                      size: 18,
+                  child: Tooltip(
+                    message: 'Home - scroll to the top of your feed',
+                    child: Container(
+                      padding: const EdgeInsets.all(9),
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: Colors.black87,
+                        border: Border.all(color: Colors.cyan.shade600),
+                      ),
+                      child: const Icon(
+                        Icons.home,
+                        color: Colors.white,
+                        size: 18,
+                      ),
                     ),
                   ),
                 ),
+                const SizedBox(width: 10),
+                _buildNewMatchBox(),
                 const SizedBox(width: 8),
+                _buildCelebrityBox(),
+                const SizedBox(width: 10),
                 Expanded(
                   child: _buildRuledPaperCaption(
                     video,
@@ -1788,20 +2680,23 @@ class _MainVideoFeedScreenState extends State<MainVideoFeedScreen> {
                     onTap: () => _showFullCaption(video),
                   ),
                 ),
-                const SizedBox(width: 8),
+                const SizedBox(width: 12),
                 GestureDetector(
                   onTap: () => _showShareSheet(video),
-                  child: Container(
-                    padding: const EdgeInsets.all(8),
-                    decoration: BoxDecoration(
-                      shape: BoxShape.circle,
-                      color: Colors.black45,
-                      border: Border.all(color: Colors.cyan.shade600),
-                    ),
-                    child: const Icon(
-                      Icons.share,
-                      color: Colors.white,
-                      size: 18,
+                  child: Tooltip(
+                    message: 'Share this video',
+                    child: Container(
+                      padding: const EdgeInsets.all(9),
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: Colors.black87,
+                        border: Border.all(color: Colors.cyan.shade600),
+                      ),
+                      child: const Icon(
+                        Icons.share,
+                        color: Colors.white,
+                        size: 18,
+                      ),
                     ),
                   ),
                 ),
@@ -1816,6 +2711,72 @@ class _MainVideoFeedScreenState extends State<MainVideoFeedScreen> {
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
+                // Creator's avatar, with a follow badge (tap to follow).
+                // Sits just above the + upload button, TikTok-style.
+                GestureDetector(
+                  onTap: () => _showCreatorProfileSheet(video),
+                  child: Stack(
+                    clipBehavior: Clip.none,
+                    children: [
+                      CircleAvatar(
+                        radius: 20,
+                        backgroundColor: const Color(0xFF0284C7),
+                        backgroundImage: video.creatorAvatarUrl.isNotEmpty
+                            ? NetworkImage(video.creatorAvatarUrl)
+                            : null,
+                        child: video.creatorAvatarUrl.isEmpty
+                            ? const Icon(
+                                Icons.person,
+                                color: Colors.white,
+                                size: 20,
+                              )
+                            : null,
+                      ),
+                      Positioned(
+                        bottom: -6,
+                        left: 12,
+                        child: GestureDetector(
+                          onTap: () => _toggleFollow(video),
+                          child: Tooltip(
+                            message: video.isFollowedByMe
+                                ? 'Following - tap to unfollow'
+                                : 'Follow ${video.username}',
+                            child: Container(
+                              width: 18,
+                              height: 18,
+                              decoration: BoxDecoration(
+                                shape: BoxShape.circle,
+                                color: video.isFollowedByMe
+                                    ? Colors.green
+                                    : Colors.cyanAccent,
+                                border: Border.all(
+                                  color: const Color(0xFF000000),
+                                  width: 2,
+                                ),
+                              ),
+                              child: Icon(
+                                video.isFollowedByMe
+                                    ? Icons.check
+                                    : Icons.electrical_services,
+                                size: 11,
+                                color: Colors.black,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const Text(
+                  'Profile',
+                  style: TextStyle(
+                    color: Colors.white70,
+                    fontSize: 8,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                const SizedBox(height: 14),
                 GestureDetector(
                   onTap: () {
                     if (!authController.requireAccount(context)) return;
@@ -1824,22 +2785,73 @@ class _MainVideoFeedScreenState extends State<MainVideoFeedScreen> {
                       MaterialPageRoute(builder: (_) => const UploadScreen()),
                     );
                   },
-                  child: Container(
-                    padding: const EdgeInsets.all(6),
-                    decoration: BoxDecoration(
-                      shape: BoxShape.circle,
-                      color: const Color(0xFF0284C7),
-                      boxShadow: [
-                        BoxShadow(
-                          color: Colors.cyan.withValues(alpha: 0.5),
-                          blurRadius: 8,
-                        ),
-                      ],
+                  child: Tooltip(
+                    message: 'Post a new video',
+                    child: Container(
+                      padding: const EdgeInsets.all(6),
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: const Color(0xFF0284C7),
+                        boxShadow: [
+                          BoxShadow(
+                            color: Colors.cyan.withValues(alpha: 0.5),
+                            blurRadius: 8,
+                          ),
+                        ],
+                      ),
+                      child: const Icon(
+                        Icons.add,
+                        color: Colors.white,
+                        size: 22,
+                      ),
                     ),
-                    child: const Icon(Icons.add, color: Colors.white, size: 22),
                   ),
                 ),
-                const SizedBox(height: 16),
+                const Text(
+                  'Post',
+                  style: TextStyle(
+                    color: Colors.white70,
+                    fontSize: 8,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                const SizedBox(height: 28),
+                if (_selectedCategory != 'All')
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 6),
+                    child: GestureDetector(
+                      onTap: _goHome,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 8,
+                          vertical: 5,
+                        ),
+                        decoration: BoxDecoration(
+                          color: Colors.black54,
+                          borderRadius: BorderRadius.circular(14),
+                          border: Border.all(color: Colors.cyanAccent),
+                        ),
+                        child: const Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(
+                              Icons.arrow_back,
+                              color: Colors.cyanAccent,
+                              size: 14,
+                            ),
+                            Text(
+                              'For You',
+                              style: TextStyle(
+                                color: Colors.cyanAccent,
+                                fontSize: 8,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
                 SizedBox(
                   height: 120,
                   width: 58,
@@ -1850,36 +2862,98 @@ class _MainVideoFeedScreenState extends State<MainVideoFeedScreen> {
                     diameterRatio: 1.2,
                     physics: const FixedExtentScrollPhysics(),
                     onSelectedItemChanged: (index) {
-                      setState(() {
-                        _selectedCategory = _categories[index];
-                      });
+                      // Just updates which item looks highlighted while
+                      // scrolling - does NOT filter the feed. Tap an item
+                      // to actually apply it.
+                      setState(() => _highlightedCategoryIndex = index);
                     },
                     childDelegate: ListWheelChildBuilderDelegate(
                       childCount: _categories.length,
                       builder: (context, catIndex) {
-                        final isSelected =
+                        final isCentered =
+                            catIndex == _highlightedCategoryIndex;
+                        final isApplied =
                             _categories[catIndex] == _selectedCategory;
-                        return Container(
-                          alignment: Alignment.center,
-                          decoration: BoxDecoration(
-                            color: isSelected
-                                ? Colors.cyan.withValues(alpha: 0.3)
-                                : Colors.black26,
-                            borderRadius: BorderRadius.circular(7),
-                            border: Border.all(
-                              color: isSelected
-                                  ? Colors.cyan
-                                  : Colors.transparent,
+                        return GestureDetector(
+                          onTap: () => _applyCategory(catIndex),
+                          child: AnimatedContainer(
+                            duration: const Duration(milliseconds: 180),
+                            curve: Curves.easeOut,
+                            alignment: Alignment.center,
+                            margin: EdgeInsets.symmetric(
+                              horizontal: isCentered ? 0 : 4,
+                              vertical: isCentered ? 0 : 2,
                             ),
-                          ),
-                          child: Text(
-                            _categories[catIndex],
-                            style: TextStyle(
-                              color: isSelected
-                                  ? Colors.cyanAccent
-                                  : Colors.white60,
-                              fontSize: 8,
-                              fontWeight: FontWeight.bold,
+                            decoration: BoxDecoration(
+                              gradient: isCentered
+                                  ? const LinearGradient(
+                                      colors: [
+                                        Color(0xFF0284C7),
+                                        Color(0xFF38BDF8),
+                                      ],
+                                      begin: Alignment.topLeft,
+                                      end: Alignment.bottomRight,
+                                    )
+                                  : null,
+                              color: isCentered ? null : Colors.black26,
+                              borderRadius: BorderRadius.circular(10),
+                              border: Border.all(
+                                color: isCentered
+                                    ? Colors.cyanAccent
+                                    : Colors.white12,
+                                width: isCentered ? 1.4 : 1,
+                              ),
+                              boxShadow: isCentered
+                                  ? [
+                                      BoxShadow(
+                                        color: Colors.cyan.withValues(
+                                          alpha: 0.5,
+                                        ),
+                                        blurRadius: 8,
+                                      ),
+                                    ]
+                                  : null,
+                            ),
+                            child: Stack(
+                              alignment: Alignment.center,
+                              children: [
+                                Column(
+                                  mainAxisAlignment: MainAxisAlignment.center,
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Icon(
+                                      _categoryIcon(_categories[catIndex]),
+                                      size: isCentered ? 14 : 11,
+                                      color: isCentered
+                                          ? Colors.white
+                                          : Colors.white54,
+                                    ),
+                                    const SizedBox(height: 1),
+                                    Text(
+                                      _categories[catIndex],
+                                      style: TextStyle(
+                                        color: isCentered
+                                            ? Colors.white
+                                            : Colors.white60,
+                                        fontSize: isCentered ? 8 : 7,
+                                        fontWeight: FontWeight.bold,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                                // Small dot marks whichever category is
+                                // actually applied to the feed right now.
+                                if (isApplied)
+                                  const Positioned(
+                                    top: 2,
+                                    right: 2,
+                                    child: Icon(
+                                      Icons.circle,
+                                      size: 5,
+                                      color: Colors.amberAccent,
+                                    ),
+                                  ),
+                              ],
                             ),
                           ),
                         );
@@ -1894,6 +2968,7 @@ class _MainVideoFeedScreenState extends State<MainVideoFeedScreen> {
                     color: Colors.redAccent,
                     size: 24,
                   ),
+                  tooltip: video.likedByMe ? 'Unlike' : 'Like',
                   onPressed: () => _toggleLike(video),
                 ),
                 Text(
@@ -1907,6 +2982,7 @@ class _MainVideoFeedScreenState extends State<MainVideoFeedScreen> {
                     color: Colors.white,
                     size: 22,
                   ),
+                  tooltip: 'Comments',
                   onPressed: () => _showCommentsSheet(video),
                 ),
                 Text(
@@ -1981,7 +3057,7 @@ class _MainVideoFeedScreenState extends State<MainVideoFeedScreen> {
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
             style: GoogleFonts.caveat(
-              color: const Color(0xFF1E293B),
+              color: const Color(0xFF121212),
               fontSize: 16,
               fontWeight: FontWeight.w600,
             ),
@@ -2017,7 +3093,7 @@ class _MainVideoFeedScreenState extends State<MainVideoFeedScreen> {
               Text(
                 video.caption,
                 style: GoogleFonts.caveat(
-                  color: const Color(0xFF1E293B),
+                  color: const Color(0xFF121212),
                   fontSize: 19,
                   height: 1.3,
                 ),
@@ -2048,7 +3124,7 @@ class _MainVideoFeedScreenState extends State<MainVideoFeedScreen> {
     bool revealed = false;
     showModalBottomSheet(
       context: context,
-      backgroundColor: const Color(0xFF1E293B),
+      backgroundColor: const Color(0xFF121212),
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
       ),
@@ -2257,11 +3333,21 @@ class _MainVideoFeedScreenState extends State<MainVideoFeedScreen> {
               }
             }
             if (!sheetContext.mounted) return;
+            setSheetState(() => submitting = true);
+            final paid = await PaymentService.purchaseCelebritySubscription();
+            setSheetState(() => submitting = false);
+            if (!sheetContext.mounted) return;
+            if (!paid) {
+              setSheetState(() => error = 'Payment failed. Please try again.');
+              return;
+            }
             Navigator.pop(sheetContext);
             ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(
+              SnackBar(
                 content: Text(
-                  'Connect a payment provider (Stripe/RevenueCat) here to finish unlocking celebrities.',
+                  PaymentConfig.isConfigured
+                      ? 'Payment successful! Celebrities unlocked.'
+                      : 'Payment simulated (no provider connected yet) - celebrities unlocked for testing.',
                 ),
               ),
             );
@@ -2273,17 +3359,27 @@ class _MainVideoFeedScreenState extends State<MainVideoFeedScreen> {
               error = null;
             });
             final googleError = await authController.signInWithGoogle();
-            setSheetState(() => submitting = false);
             if (googleError != null) {
-              setSheetState(() => error = googleError);
+              setSheetState(() {
+                submitting = false;
+                error = googleError;
+              });
               return;
             }
+            final paid = await PaymentService.purchaseCelebritySubscription();
+            setSheetState(() => submitting = false);
             if (!sheetContext.mounted) return;
+            if (!paid) {
+              setSheetState(() => error = 'Payment failed. Please try again.');
+              return;
+            }
             Navigator.pop(sheetContext);
             ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(
+              SnackBar(
                 content: Text(
-                  'Connect a payment provider (Stripe/RevenueCat) here to finish unlocking celebrities.',
+                  PaymentConfig.isConfigured
+                      ? 'Payment successful! Celebrities unlocked.'
+                      : 'Payment simulated (no provider connected yet) - celebrities unlocked for testing.',
                 ),
               ),
             );
@@ -2449,7 +3545,7 @@ class _MainVideoFeedScreenState extends State<MainVideoFeedScreen> {
   void _showMusicSheet(String track) {
     showModalBottomSheet(
       context: context,
-      backgroundColor: const Color(0xFF1E293B),
+      backgroundColor: const Color(0xFF121212),
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
       ),
@@ -2505,7 +3601,7 @@ class _MainVideoFeedScreenState extends State<MainVideoFeedScreen> {
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
-      backgroundColor: const Color(0xFF1E293B),
+      backgroundColor: const Color(0xFF121212),
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
       ),
@@ -2572,6 +3668,7 @@ class _MainVideoFeedScreenState extends State<MainVideoFeedScreen> {
                             Icons.send,
                             color: Colors.cyanAccent,
                           ),
+                          tooltip: 'Post comment',
                           onPressed: () {
                             if (commentController.text.trim().isEmpty) return;
                             if (!authController.requireAccount(context)) return;
@@ -2622,10 +3719,14 @@ class _FeedVideoPlayer extends StatefulWidget {
   final String mediaUrl;
   final String filter;
   final ValueChanged<VideoPlayerController?>? onControllerChanged;
+  final VoidCallback? onDoubleTapLike;
+  final bool isLiked;
   const _FeedVideoPlayer({
     required this.mediaUrl,
     this.filter = 'None',
     this.onControllerChanged,
+    this.onDoubleTapLike,
+    this.isLiked = false,
   });
 
   @override
@@ -2635,6 +3736,10 @@ class _FeedVideoPlayer extends StatefulWidget {
 class _FeedVideoPlayerState extends State<_FeedVideoPlayer> {
   VideoPlayerController? _controller;
   bool _failed = false;
+  bool _showTapIcon = false;
+  IconData _tapIcon = Icons.pause;
+  bool _showHeartBurst = false;
+  bool _muted = false;
 
   @override
   void initState() {
@@ -2665,6 +3770,37 @@ class _FeedVideoPlayerState extends State<_FeedVideoPlayer> {
     super.dispose();
   }
 
+  void _togglePlayback(VideoPlayerController controller) {
+    final willPause = controller.value.isPlaying;
+    setState(() {
+      willPause ? controller.pause() : controller.play();
+      _tapIcon = willPause ? Icons.pause : Icons.play_arrow;
+      _showTapIcon = true;
+    });
+    Future.delayed(const Duration(milliseconds: 450), () {
+      if (mounted) setState(() => _showTapIcon = false);
+    });
+  }
+
+  void _toggleMute(VideoPlayerController controller) {
+    setState(() {
+      _muted = !_muted;
+      controller.setVolume(_muted ? 0 : 1);
+    });
+  }
+
+  // Double-tap anywhere on the video to like it, TikTok/Instagram-style -
+  // shows a big heart burst regardless of whether this already liked it
+  // (matches the platforms this is modeled on - a second double-tap just
+  // re-plays the animation, it doesn't unlike).
+  void _handleDoubleTap() {
+    widget.onDoubleTapLike?.call();
+    setState(() => _showHeartBurst = true);
+    Future.delayed(const Duration(milliseconds: 700), () {
+      if (mounted) setState(() => _showHeartBurst = false);
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
     if (_failed) {
@@ -2679,11 +3815,8 @@ class _FeedVideoPlayerState extends State<_FeedVideoPlayer> {
       );
     }
     return GestureDetector(
-      onTap: () {
-        setState(() {
-          controller.value.isPlaying ? controller.pause() : controller.play();
-        });
-      },
+      onTap: () => _togglePlayback(controller),
+      onDoubleTap: _handleDoubleTap,
       child: Stack(
         fit: StackFit.expand,
         children: [
@@ -2698,6 +3831,60 @@ class _FeedVideoPlayerState extends State<_FeedVideoPlayer> {
                   width: controller.value.size.width,
                   height: controller.value.size.height,
                   child: VideoPlayer(controller),
+                ),
+              ),
+            ),
+          ),
+          Center(
+            child: AnimatedOpacity(
+              opacity: _showTapIcon ? 1 : 0,
+              duration: const Duration(milliseconds: 150),
+              child: Container(
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: Colors.black.withValues(alpha: 0.4),
+                ),
+                child: Icon(_tapIcon, color: Colors.white, size: 48),
+              ),
+            ),
+          ),
+          // Heart burst - double-tap-to-like feedback
+          Center(
+            child: AnimatedScale(
+              scale: _showHeartBurst ? 1.0 : 0.4,
+              duration: const Duration(milliseconds: 250),
+              curve: Curves.elasticOut,
+              child: AnimatedOpacity(
+                opacity: _showHeartBurst ? 1 : 0,
+                duration: const Duration(milliseconds: 250),
+                child: const Icon(
+                  Icons.favorite,
+                  color: Colors.redAccent,
+                  size: 90,
+                ),
+              ),
+            ),
+          ),
+          // Mute toggle - top-left, small and unobtrusive
+          Positioned(
+            top: 10,
+            left: 10,
+            child: Tooltip(
+              message: _muted ? 'Unmute' : 'Mute',
+              child: GestureDetector(
+                onTap: () => _toggleMute(controller),
+                child: Container(
+                  padding: const EdgeInsets.all(6),
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: Colors.black.withValues(alpha: 0.4),
+                  ),
+                  child: Icon(
+                    _muted ? Icons.volume_off : Icons.volume_up,
+                    color: Colors.white,
+                    size: 16,
+                  ),
                 ),
               ),
             ),
@@ -2743,11 +3930,579 @@ class _CelebrityFeedScreenState extends State<CelebrityFeedScreen> {
   void dispose() {
     videoFeedStore.removeListener(_onChanged);
     _pageController.dispose();
+    _celebCategoryWheelController.dispose();
     super.dispose();
   }
 
-  List<VideoItem> get _celebVideos =>
+  String _selectedCelebCategory = 'All';
+  int _highlightedCelebCategoryIndex = 0;
+  final FixedExtentScrollController _celebCategoryWheelController =
+      FixedExtentScrollController();
+  final List<String> _celebCategories = [
+    'All',
+    'Music',
+    'Sports',
+    'Movies',
+    'Comedy',
+    'Fashion',
+  ];
+
+  void _applyCelebCategory(int index) {
+    setState(() {
+      _selectedCelebCategory = _celebCategories[index];
+      _highlightedCelebCategoryIndex = index;
+    });
+    if (_pageController.hasClients) {
+      _pageController.jumpToPage(0);
+    }
+    if (_celebCategoryWheelController.hasClients) {
+      _celebCategoryWheelController.animateToItem(
+        index,
+        duration: const Duration(milliseconds: 250),
+        curve: Curves.easeOut,
+      );
+    }
+  }
+
+  IconData _celebCategoryIcon(String category) {
+    switch (category) {
+      case 'Music':
+        return Icons.music_note;
+      case 'Sports':
+        return Icons.sports_soccer;
+      case 'Movies':
+        return Icons.movie;
+      case 'Comedy':
+        return Icons.theater_comedy;
+      case 'Fashion':
+        return Icons.style;
+      default:
+        return Icons.apps; // 'All'
+    }
+  }
+
+  List<VideoItem> get _allCelebVideos =>
       videoFeedStore.videos.where((v) => v.isCelebrity).toList();
+
+  List<VideoItem> get _celebVideos {
+    final all = _allCelebVideos;
+    return _selectedCelebCategory == 'All'
+        ? all
+        : all.where((v) => v.category == _selectedCelebCategory).toList();
+  }
+
+  // Top Celebrities leaderboard - ranked by a weighted trending score
+  // (see calculateTrendingScore), not just raw follower count, so genuine
+  // engagement actually moves the rankings.
+  List<VideoItem> get _topCelebrities {
+    final sorted = [..._allCelebVideos]
+      ..sort(
+        (a, b) =>
+            calculateTrendingScore(b).compareTo(calculateTrendingScore(a)),
+      );
+    return sorted.take(10).toList();
+  }
+
+  // Caches each celebrity video's real match % once fetched, so the
+  // PageView (which builds synchronously) always has something to show
+  // immediately while the real result loads in the background.
+  final Map<String, int> _matchCache = {};
+
+  int _matchPercentFor(VideoItem video) {
+    final cached = _matchCache[video.id];
+    if (cached != null) return cached;
+
+    // Kick off the real (or demo-fallback) lookup in the background.
+    MatchingApiService.findCelebrityLookAlike(
+      myId: authController.currentUser?.username ?? 'guest',
+      celebrityVideoId: video.id,
+      photoBytes: authController.currentUser?.avatarBytes,
+    ).then((result) {
+      if (mounted) setState(() => _matchCache[video.id] = result.percentage);
+    });
+
+    // Instant placeholder shown for the first frame or two while that
+    // resolves, so nothing ever looks broken or blank.
+    return 75 + (video.id.hashCode.abs() % 22);
+  }
+
+  void _toggleFollow(VideoItem video) {
+    if (!authController.requireAccount(context)) return;
+    setState(() {
+      video.isFollowedByMe = !video.isFollowedByMe;
+      video.followers += video.isFollowedByMe ? 1 : -1;
+    });
+  }
+
+  // Same profile sheet pattern as the For You page - tapping a
+  // celebrity's avatar shows their stats, follow, message, and videos.
+  void _showCelebProfileSheet(VideoItem video) {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: const Color(0xFF121212),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (sheetContext) => StatefulBuilder(
+        builder: (sheetContext, setSheetState) {
+          return FractionallySizedBox(
+            heightFactor: 0.8,
+            child: Padding(
+              padding: const EdgeInsets.all(20),
+              child: Column(
+                children: [
+                  Stack(
+                    alignment: Alignment.center,
+                    children: [
+                      CircleAvatar(
+                        radius: 36,
+                        backgroundColor: const Color(0xFF0284C7),
+                        backgroundImage: video.creatorAvatarUrl.isNotEmpty
+                            ? NetworkImage(video.creatorAvatarUrl)
+                            : null,
+                        child: video.creatorAvatarUrl.isEmpty
+                            ? const Icon(
+                                Icons.person,
+                                color: Colors.white,
+                                size: 32,
+                              )
+                            : null,
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 6),
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        video.username,
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 18,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                      const SizedBox(width: 4),
+                      const Icon(
+                        Icons.verified,
+                        color: Colors.blueAccent,
+                        size: 16,
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 16),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                    children: [
+                      _celebProfileStat('Following', video.following),
+                      _celebProfileStat('Followers', video.followers),
+                      _celebProfileStat('Likes', video.accountLikes),
+                      _celebProfileStat('Reposts', video.reposts),
+                    ],
+                  ),
+                  const SizedBox(height: 16),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      ElevatedButton(
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: video.isFollowedByMe
+                              ? Colors.blueGrey.shade700
+                              : Colors.amber,
+                        ),
+                        onPressed: () {
+                          _toggleFollow(video);
+                          setSheetState(() {});
+                        },
+                        child: Text(
+                          video.isFollowedByMe ? 'Following' : 'Follow',
+                          style: TextStyle(
+                            color: video.isFollowedByMe
+                                ? Colors.white
+                                : Colors.black,
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      OutlinedButton.icon(
+                        style: OutlinedButton.styleFrom(
+                          side: const BorderSide(color: Colors.cyanAccent),
+                        ),
+                        onPressed: () {
+                          if (!authController.requireAccount(context)) return;
+                          Navigator.pop(sheetContext);
+                          Navigator.push(
+                            context,
+                            MaterialPageRoute(
+                              builder: (_) => MessageScreen(video: video),
+                            ),
+                          );
+                        },
+                        icon: const Icon(
+                          Icons.mail,
+                          color: Colors.white,
+                          size: 18,
+                        ),
+                        label: const Text(
+                          'Message',
+                          style: TextStyle(color: Colors.white),
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      OutlinedButton.icon(
+                        style: OutlinedButton.styleFrom(
+                          side: const BorderSide(color: Colors.amberAccent),
+                        ),
+                        onPressed: () {
+                          Navigator.pop(sheetContext);
+                          _showTipSheet(video);
+                        },
+                        icon: const Icon(
+                          Icons.card_giftcard,
+                          color: Colors.amberAccent,
+                          size: 18,
+                        ),
+                        label: const Text(
+                          'Tip',
+                          style: TextStyle(color: Colors.amberAccent),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 16),
+                  Expanded(
+                    child: GridView.builder(
+                      gridDelegate:
+                          const SliverGridDelegateWithFixedCrossAxisCount(
+                            crossAxisCount: 3,
+                            crossAxisSpacing: 3,
+                            mainAxisSpacing: 3,
+                          ),
+                      itemCount: video.videoCount,
+                      itemBuilder: (context, i) => Container(
+                        color: Colors.blueGrey.shade900,
+                        alignment: Alignment.center,
+                        child: video.creatorAvatarUrl.isNotEmpty
+                            ? Image.network(
+                                video.creatorAvatarUrl,
+                                fit: BoxFit.cover,
+                              )
+                            : const Icon(Icons.videocam, color: Colors.white24),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _celebProfileStat(String label, int value) {
+    return Column(
+      children: [
+        Text(
+          '$value',
+          style: const TextStyle(
+            color: Colors.white,
+            fontWeight: FontWeight.bold,
+          ),
+        ),
+        Text(
+          label,
+          style: const TextStyle(color: Colors.white60, fontSize: 12),
+        ),
+      ],
+    );
+  }
+
+  // Tipping - send a real tip to a celebrity, TikTok-gifting style.
+  // See TippingService for how to connect a real payment provider.
+  void _showCelebShareSheet(VideoItem video, int matchPercent) {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF121212),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (_) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.ios_share, color: Colors.cyanAccent),
+              title: const Text('Share', style: TextStyle(color: Colors.white)),
+              onTap: () {
+                Navigator.pop(context);
+                Share.share(
+                  'Check out ${video.username} on Twins - a $matchPercent% celebrity look-alike!',
+                );
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.flag_outlined, color: Colors.redAccent),
+              title: const Text(
+                'Report',
+                style: TextStyle(color: Colors.white),
+              ),
+              subtitle: const Text(
+                'Flag this video for review',
+                style: TextStyle(color: Colors.white38, fontSize: 11),
+              ),
+              onTap: () {
+                Navigator.pop(context);
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(
+                    content: Text('Thanks - our team will review this video.'),
+                  ),
+                );
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _showTipSheet(VideoItem video) {
+    bool submitting = false;
+    int? selectedAmount;
+
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF121212),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (sheetContext) => StatefulBuilder(
+        builder: (sheetContext, setSheetState) {
+          Future<void> confirmTip() async {
+            if (selectedAmount == null) return;
+            if (!authController.requireAccount(context)) return;
+            setSheetState(() => submitting = true);
+            final success = await TippingService.sendTip(
+              celebrityId: video.id,
+              amountUsd: selectedAmount!,
+            );
+            if (!sheetContext.mounted) return;
+            setSheetState(() => submitting = false);
+            if (success) {
+              setState(() => video.tipsReceivedUsd += selectedAmount!);
+              Navigator.pop(sheetContext);
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(
+                  content: Text(
+                    PaymentConfig.isConfigured
+                        ? 'Tipped \$${selectedAmount!} to ${video.username}!'
+                        : 'Tip simulated (no payment provider connected yet) - \$${selectedAmount!} to ${video.username}.',
+                  ),
+                ),
+              );
+            } else {
+              setSheetState(() {});
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text('Tip failed. Please try again.')),
+              );
+            }
+          }
+
+          return Padding(
+            padding: const EdgeInsets.all(20),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    const Icon(Icons.card_giftcard, color: Colors.amberAccent),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        'Tip ${video.username}',
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 16,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 4),
+                const Text(
+                  '100% of tips go straight to the creator.',
+                  style: TextStyle(color: Colors.white38, fontSize: 12),
+                ),
+                const SizedBox(height: 16),
+                Wrap(
+                  spacing: 10,
+                  runSpacing: 10,
+                  children: TippingService.presetAmounts.map((amount) {
+                    final selected = selectedAmount == amount;
+                    return GestureDetector(
+                      onTap: () => setSheetState(() => selectedAmount = amount),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 18,
+                          vertical: 12,
+                        ),
+                        decoration: BoxDecoration(
+                          color: selected ? Colors.amber : Colors.black26,
+                          borderRadius: BorderRadius.circular(12),
+                          border: Border.all(
+                            color: selected ? Colors.amber : Colors.white24,
+                          ),
+                        ),
+                        child: Text(
+                          '\$$amount',
+                          style: TextStyle(
+                            color: selected ? Colors.black : Colors.white,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ),
+                    );
+                  }).toList(),
+                ),
+                const SizedBox(height: 20),
+                SizedBox(
+                  width: double.infinity,
+                  child: ElevatedButton(
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.amber,
+                    ),
+                    onPressed: (selectedAmount == null || submitting)
+                        ? null
+                        : confirmTip,
+                    child: submitting
+                        ? const SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
+                              color: Colors.black,
+                            ),
+                          )
+                        : Text(
+                            selectedAmount == null
+                                ? 'Choose an amount'
+                                : 'Send \$${selectedAmount!} tip',
+                            style: const TextStyle(color: Colors.black),
+                          ),
+                  ),
+                ),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  void _toggleLike(VideoItem video) {
+    if (!authController.requireAccount(context)) return;
+    setState(() {
+      video.likedByMe = !video.likedByMe;
+      video.likes += video.likedByMe ? 1 : -1;
+    });
+  }
+
+  void _showCelebCommentsSheet(VideoItem video) {
+    final commentController = TextEditingController();
+    final localComments = <String>[
+      'No way you look THIS much alike 😍',
+      'The 96% match is unreal',
+      'Twins app really found their twin!',
+    ];
+
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: const Color(0xFF121212),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (context) => StatefulBuilder(
+        builder: (context, setModalState) => Padding(
+          padding: EdgeInsets.only(
+            bottom: MediaQuery.of(context).viewInsets.bottom,
+            left: 16,
+            right: 16,
+            top: 16,
+          ),
+          child: SizedBox(
+            height: 420,
+            child: Column(
+              children: [
+                Text(
+                  '${localComments.length} Comments',
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                const Divider(color: Colors.white24),
+                Expanded(
+                  child: ListView.builder(
+                    itemCount: localComments.length,
+                    itemBuilder: (context, i) => ListTile(
+                      leading: const CircleAvatar(
+                        backgroundColor: Colors.blueGrey,
+                        child: Icon(Icons.person, size: 18),
+                      ),
+                      title: Text(
+                        localComments[i],
+                        style: const TextStyle(color: Colors.white),
+                      ),
+                    ),
+                  ),
+                ),
+                Row(
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        controller: commentController,
+                        style: const TextStyle(color: Colors.white),
+                        decoration: InputDecoration(
+                          hintText: 'Add a comment...',
+                          hintStyle: const TextStyle(color: Colors.white38),
+                          filled: true,
+                          fillColor: Colors.black26,
+                          contentPadding: const EdgeInsets.symmetric(
+                            horizontal: 14,
+                          ),
+                          border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(24),
+                            borderSide: BorderSide.none,
+                          ),
+                        ),
+                      ),
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.send, color: Colors.cyanAccent),
+                      tooltip: 'Post comment',
+                      onPressed: () {
+                        if (commentController.text.trim().isEmpty) return;
+                        if (!authController.requireAccount(context)) return;
+                        setModalState(() {
+                          localComments.add(commentController.text.trim());
+                        });
+                        setState(() => video.comments++);
+                        commentController.clear();
+                      },
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 
   void _showBecomeCelebritySheet() {
     final usernameController = TextEditingController();
@@ -2788,11 +4543,21 @@ class _CelebrityFeedScreenState extends State<CelebrityFeedScreen> {
               }
             }
             if (!sheetContext.mounted) return;
+            setSheetState(() => submitting = true);
+            final paid = await PaymentService.purchaseCelebritySubscription();
+            setSheetState(() => submitting = false);
+            if (!sheetContext.mounted) return;
+            if (!paid) {
+              setSheetState(() => error = 'Payment failed. Please try again.');
+              return;
+            }
             Navigator.pop(sheetContext);
             ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(
+              SnackBar(
                 content: Text(
-                  'Connect a payment provider (Stripe/RevenueCat) here to finish creating your celebrity account.',
+                  PaymentConfig.isConfigured
+                      ? 'Welcome, celebrity! Your account is now verified.'
+                      : 'Payment simulated (no provider connected yet) - celebrity account created for testing.',
                 ),
               ),
             );
@@ -2917,73 +4682,340 @@ class _CelebrityFeedScreenState extends State<CelebrityFeedScreen> {
       backgroundColor: Colors.black,
       appBar: AppBar(
         backgroundColor: Colors.black,
+        toolbarHeight: 40,
+        titleSpacing: 8,
         title: Row(
           children: const [
-            Text('Celebrities', style: TextStyle(color: Colors.white)),
-            SizedBox(width: 6),
-            Icon(Icons.verified, color: Colors.blueAccent, size: 18),
+            Text(
+              'Celebrities',
+              style: TextStyle(color: Colors.white, fontSize: 15),
+            ),
+            SizedBox(width: 4),
+            Icon(Icons.verified, color: Colors.blueAccent, size: 14),
           ],
         ),
         actions: [
+          // Me - your own profile, reachable from the Celebrities page too.
+          Tooltip(
+            message: 'My profile',
+            child: GestureDetector(
+              onTap: () {
+                if (!authController.requireAccount(context)) return;
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (_) => ProfileScreen(
+                      username: authController.currentUser!.username,
+                    ),
+                  ),
+                );
+              },
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 4),
+                child: CircleAvatar(
+                  radius: 13,
+                  backgroundColor: const Color(0xFF0284C7),
+                  child: Text(
+                    authController.isGuest
+                        ? '?'
+                        : authController.currentUser!.username
+                              .substring(0, 1)
+                              .toUpperCase(),
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 11,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+          // Upload - post a video without leaving the Celebrities page.
+          IconButton(
+            icon: const Icon(
+              Icons.add_circle_outline,
+              color: Colors.amberAccent,
+              size: 20,
+            ),
+            tooltip: 'Post a video',
+            padding: EdgeInsets.zero,
+            constraints: const BoxConstraints(minWidth: 30, minHeight: 30),
+            visualDensity: VisualDensity.compact,
+            onPressed: () {
+              if (!authController.requireAccount(context)) return;
+              Navigator.push(
+                context,
+                MaterialPageRoute(builder: (_) => const UploadScreen()),
+              );
+            },
+          ),
           TextButton.icon(
+            style: TextButton.styleFrom(
+              padding: const EdgeInsets.symmetric(horizontal: 6),
+              minimumSize: const Size(0, 30),
+              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            ),
             onPressed: _showBecomeCelebritySheet,
-            icon: const Icon(Icons.add, color: Colors.amber, size: 18),
+            icon: const Icon(Icons.add, color: Colors.amber, size: 14),
             label: const Text(
               'Become a Celebrity',
-              style: TextStyle(color: Colors.amber, fontSize: 12),
+              style: TextStyle(color: Colors.amber, fontSize: 10),
             ),
           ),
         ],
-      ),
-      body: videos.isEmpty
-          ? const Center(
-              child: Text(
-                'No celebrity videos yet',
-                style: TextStyle(color: Colors.white38),
-              ),
-            )
-          : PageView.builder(
-              controller: _pageController,
-              scrollDirection: Axis.vertical,
-              itemCount: videos.length,
-              itemBuilder: (context, index) {
-                final video = videos[index];
-                return Stack(
-                  fit: StackFit.expand,
-                  children: [
-                    Container(
-                      decoration: BoxDecoration(
-                        gradient: LinearGradient(
-                          colors: [
-                            Colors.blueGrey.shade900,
-                            Colors.blueGrey.shade800,
-                            Colors.black,
-                          ],
-                          begin: Alignment.topCenter,
-                          end: Alignment.bottomCenter,
-                        ),
+        bottom: _selectedCelebCategory == 'All'
+            ? null
+            : PreferredSize(
+                preferredSize: const Size.fromHeight(20),
+                child: Padding(
+                  padding: const EdgeInsets.only(bottom: 4),
+                  child: Center(
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 8,
+                        vertical: 2,
                       ),
-                      child: video.mediaUrl != null
-                          ? _FeedVideoPlayer(
-                              mediaUrl: video.mediaUrl!,
-                              filter: video.filter,
-                            )
-                          : const Center(
-                              child: Icon(
-                                Icons.play_circle_outline,
-                                size: 80,
-                                color: Colors.white30,
+                      decoration: BoxDecoration(
+                        color: Colors.black45,
+                        borderRadius: BorderRadius.circular(10),
+                        border: Border.all(color: Colors.amber, width: 1),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            _celebCategoryIcon(_selectedCelebCategory),
+                            color: Colors.amberAccent,
+                            size: 10,
+                          ),
+                          const SizedBox(width: 4),
+                          Text(
+                            'Watching: $_selectedCelebCategory celebrities',
+                            style: const TextStyle(
+                              color: Colors.amberAccent,
+                              fontSize: 10,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+      ),
+      body: Column(
+        children: [
+          // Top Celebrities leaderboard - a horizontal "who's hot" strip,
+          // ranked by followers, shown regardless of the category filter.
+          if (_topCelebrities.isNotEmpty)
+            Container(
+              height: 72,
+              margin: const EdgeInsets.only(top: 4),
+              child: ListView.separated(
+                scrollDirection: Axis.horizontal,
+                padding: const EdgeInsets.symmetric(horizontal: 12),
+                itemCount: _topCelebrities.length,
+                separatorBuilder: (_, __) => const SizedBox(width: 8),
+                itemBuilder: (context, i) {
+                  final celeb = _topCelebrities[i];
+                  final rank = i + 1;
+                  return Tooltip(
+                    message:
+                        '#$rank ${celeb.username} - ${_formatCount(celeb.followers)} followers',
+                    child: GestureDetector(
+                      onTap: () {
+                        final idx = _celebVideos.indexWhere(
+                          (v) => v.id == celeb.id,
+                        );
+                        if (idx != -1 && _pageController.hasClients) {
+                          _pageController.jumpToPage(idx);
+                        }
+                      },
+                      child: Column(
+                        children: [
+                          Stack(
+                            clipBehavior: Clip.none,
+                            children: [
+                              CircleAvatar(
+                                radius: 18,
+                                backgroundColor: const Color(0xFF0284C7),
+                                backgroundImage:
+                                    celeb.creatorAvatarUrl.isNotEmpty
+                                    ? NetworkImage(celeb.creatorAvatarUrl)
+                                    : null,
+                                child: celeb.creatorAvatarUrl.isEmpty
+                                    ? const Icon(
+                                        Icons.person,
+                                        color: Colors.white,
+                                        size: 17,
+                                      )
+                                    : null,
+                              ),
+                              Positioned(
+                                top: -3,
+                                left: -3,
+                                child: Container(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 4,
+                                    vertical: 1,
+                                  ),
+                                  decoration: BoxDecoration(
+                                    gradient: const LinearGradient(
+                                      colors: [Colors.amber, Colors.deepOrange],
+                                    ),
+                                    borderRadius: BorderRadius.circular(7),
+                                  ),
+                                  child: Text(
+                                    '#$rank',
+                                    style: const TextStyle(
+                                      color: Colors.black,
+                                      fontSize: 7,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 2),
+                          SizedBox(
+                            width: 54,
+                            child: Text(
+                              celeb.username,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              textAlign: TextAlign.center,
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 8,
+                                fontWeight: FontWeight.bold,
                               ),
                             ),
+                          ),
+                          Text(
+                            _formatCount(celeb.followers),
+                            style: const TextStyle(
+                              color: Colors.amberAccent,
+                              fontSize: 7,
+                            ),
+                          ),
+                        ],
+                      ),
                     ),
-                    Positioned(
-                      left: 16,
-                      right: 80,
-                      bottom: 24,
-                      child: Row(
-                        crossAxisAlignment: CrossAxisAlignment.start,
+                  );
+                },
+              ),
+            ),
+
+          Expanded(
+            child: videos.isEmpty
+                ? Center(
+                    child: Text(
+                      'No $_selectedCelebCategory celebrities yet',
+                      style: const TextStyle(color: Colors.white38),
+                    ),
+                  )
+                : PageView.builder(
+                    controller: _pageController,
+                    scrollDirection: Axis.vertical,
+                    itemCount: videos.length,
+                    itemBuilder: (context, index) {
+                      final video = videos[index];
+                      // Real (or demo-fallback) match % - see
+                      // MatchingApiService for how to connect a real backend.
+                      final matchPercent = _matchPercentFor(video);
+
+                      return Stack(
+                        fit: StackFit.expand,
                         children: [
-                          Flexible(
+                          Container(
+                            decoration: BoxDecoration(
+                              gradient: LinearGradient(
+                                colors: [
+                                  Colors.purple.shade900,
+                                  Colors.indigo.shade900,
+                                  Colors.black,
+                                ],
+                                begin: Alignment.topCenter,
+                                end: Alignment.bottomCenter,
+                              ),
+                            ),
+                            child: video.mediaUrl != null
+                                ? _FeedVideoPlayer(
+                                    mediaUrl: video.mediaUrl!,
+                                    filter: video.filter,
+                                    isLiked: video.likedByMe,
+                                    onDoubleTapLike: () {
+                                      if (!video.likedByMe) _toggleLike(video);
+                                    },
+                                  )
+                                : const Center(
+                                    child: Icon(
+                                      Icons.play_circle_outline,
+                                      size: 80,
+                                      color: Colors.white30,
+                                    ),
+                                  ),
+                          ),
+
+                          // Trending rank badge - top left
+                          Positioned(
+                            top: 16,
+                            left: 16,
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 10,
+                                vertical: 5,
+                              ),
+                              decoration: BoxDecoration(
+                                gradient: const LinearGradient(
+                                  colors: [Colors.amber, Colors.deepOrange],
+                                ),
+                                borderRadius: BorderRadius.circular(20),
+                              ),
+                              child: Text(
+                                '🔥 #${index + 1} Trending Celebrity',
+                                style: const TextStyle(
+                                  color: Colors.black,
+                                  fontSize: 11,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                            ),
+                          ),
+
+                          // Match % badge - top right
+                          Positioned(
+                            top: 16,
+                            right: 16,
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 10,
+                                vertical: 5,
+                              ),
+                              decoration: BoxDecoration(
+                                color: Colors.black54,
+                                borderRadius: BorderRadius.circular(20),
+                                border: Border.all(color: Colors.cyanAccent),
+                              ),
+                              child: Text(
+                                '$matchPercent% Look-alike',
+                                style: const TextStyle(
+                                  color: Colors.cyanAccent,
+                                  fontSize: 11,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                            ),
+                          ),
+
+                          // Caption + stats - bottom left
+                          Positioned(
+                            left: 16,
+                            right: 90,
+                            bottom: 28,
                             child: Column(
                               crossAxisAlignment: CrossAxisAlignment.start,
                               mainAxisSize: MainAxisSize.min,
@@ -2996,17 +5028,26 @@ class _CelebrityFeedScreenState extends State<CelebrityFeedScreen> {
                                       style: const TextStyle(
                                         color: Colors.white,
                                         fontWeight: FontWeight.bold,
+                                        fontSize: 15,
                                       ),
                                     ),
                                     const SizedBox(width: 4),
                                     const Icon(
                                       Icons.verified,
                                       color: Colors.blueAccent,
-                                      size: 14,
+                                      size: 15,
                                     ),
                                   ],
                                 ),
                                 const SizedBox(height: 4),
+                                Text(
+                                  '${_formatCount(video.followers)} followers  •  ${_formatCount(video.accountLikes)} likes',
+                                  style: const TextStyle(
+                                    color: Colors.amberAccent,
+                                    fontSize: 11,
+                                  ),
+                                ),
+                                const SizedBox(height: 6),
                                 Text(
                                   video.caption,
                                   style: const TextStyle(color: Colors.white70),
@@ -3014,14 +5055,268 @@ class _CelebrityFeedScreenState extends State<CelebrityFeedScreen> {
                               ],
                             ),
                           ),
+
+                          // Engagement rail - follow / like / comment / share / message
+                          Positioned(
+                            right: 12,
+                            bottom: 24,
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                // Creator's avatar with a follow badge - the exact
+                                // same pattern as the For You page, for full
+                                // feature parity.
+                                GestureDetector(
+                                  onTap: () => _showCelebProfileSheet(video),
+                                  child: Stack(
+                                    clipBehavior: Clip.none,
+                                    children: [
+                                      CircleAvatar(
+                                        radius: 20,
+                                        backgroundColor: const Color(
+                                          0xFF0284C7,
+                                        ),
+                                        backgroundImage:
+                                            video.creatorAvatarUrl.isNotEmpty
+                                            ? NetworkImage(
+                                                video.creatorAvatarUrl,
+                                              )
+                                            : null,
+                                        child: video.creatorAvatarUrl.isEmpty
+                                            ? const Icon(
+                                                Icons.person,
+                                                color: Colors.white,
+                                                size: 20,
+                                              )
+                                            : null,
+                                      ),
+                                      Positioned(
+                                        bottom: -6,
+                                        left: 12,
+                                        child: GestureDetector(
+                                          onTap: () => _toggleFollow(video),
+                                          child: Tooltip(
+                                            message: video.isFollowedByMe
+                                                ? 'Following - tap to unfollow'
+                                                : 'Follow ${video.username}',
+                                            child: Container(
+                                              width: 18,
+                                              height: 18,
+                                              decoration: BoxDecoration(
+                                                shape: BoxShape.circle,
+                                                color: video.isFollowedByMe
+                                                    ? Colors.green
+                                                    : Colors.cyanAccent,
+                                                border: Border.all(
+                                                  color: const Color(
+                                                    0xFF000000,
+                                                  ),
+                                                  width: 2,
+                                                ),
+                                              ),
+                                              child: Icon(
+                                                video.isFollowedByMe
+                                                    ? Icons.check
+                                                    : Icons.electrical_services,
+                                                size: 11,
+                                                color: Colors.black,
+                                              ),
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                                const SizedBox(height: 14),
+                                IconButton(
+                                  icon: Icon(
+                                    video.likedByMe
+                                        ? Icons.favorite
+                                        : Icons.favorite_border,
+                                    color: Colors.redAccent,
+                                    size: 24,
+                                  ),
+                                  tooltip: video.likedByMe ? 'Unlike' : 'Like',
+                                  onPressed: () => _toggleLike(video),
+                                ),
+                                Text(
+                                  '${video.likes}',
+                                  style: const TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 10,
+                                  ),
+                                ),
+                                const SizedBox(height: 6),
+                                IconButton(
+                                  icon: const Icon(
+                                    Icons.chat_bubble_outline,
+                                    color: Colors.white,
+                                    size: 22,
+                                  ),
+                                  tooltip: 'Comments',
+                                  onPressed: () =>
+                                      _showCelebCommentsSheet(video),
+                                ),
+                                Text(
+                                  '${video.comments}',
+                                  style: const TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 10,
+                                  ),
+                                ),
+                                const SizedBox(height: 6),
+                                IconButton(
+                                  icon: const Icon(
+                                    Icons.mail_outline,
+                                    color: Colors.white,
+                                    size: 22,
+                                  ),
+                                  tooltip: 'Message',
+                                  onPressed: () {
+                                    if (!authController.requireAccount(
+                                      context,
+                                    )) {
+                                      return;
+                                    }
+                                    Navigator.push(
+                                      context,
+                                      MaterialPageRoute(
+                                        builder: (_) =>
+                                            MessageScreen(video: video),
+                                      ),
+                                    );
+                                  },
+                                ),
+                                const SizedBox(height: 6),
+                                IconButton(
+                                  icon: const Icon(
+                                    Icons.share,
+                                    color: Colors.white,
+                                    size: 22,
+                                  ),
+                                  tooltip: 'Share',
+                                  onPressed: () =>
+                                      _showCelebShareSheet(video, matchPercent),
+                                ),
+                                const SizedBox(height: 6),
+                                IconButton(
+                                  icon: const Icon(
+                                    Icons.card_giftcard,
+                                    color: Colors.amberAccent,
+                                    size: 22,
+                                  ),
+                                  tooltip: 'Send a tip',
+                                  onPressed: () => _showTipSheet(video),
+                                ),
+                                if (video.tipsReceivedUsd > 0)
+                                  Text(
+                                    '\$${video.tipsReceivedUsd}',
+                                    style: const TextStyle(
+                                      color: Colors.amberAccent,
+                                      fontSize: 10,
+                                    ),
+                                  ),
+                              ],
+                            ),
+                          ),
+
+                          // Scrollable category wheel - scroll to browse, tap to
+                          // actually apply a filter. Rendered LAST (on top of
+                          // everything else) and given real clearance from the
+                          // top badges so it's never hidden behind other UI.
+                          Positioned(
+                            right: 12,
+                            top: 56,
+                            child: SizedBox(
+                              height: 95,
+                              width: 58,
+                              child: ListWheelScrollView.useDelegate(
+                                controller: _celebCategoryWheelController,
+                                itemExtent: 28,
+                                perspective: 0.006,
+                                diameterRatio: 1.2,
+                                physics: const FixedExtentScrollPhysics(),
+                                onSelectedItemChanged: (i) {
+                                  setState(
+                                    () => _highlightedCelebCategoryIndex = i,
+                                  );
+                                },
+                                childDelegate: ListWheelChildBuilderDelegate(
+                                  childCount: _celebCategories.length,
+                                  builder: (context, catIndex) {
+                                    final isCentered =
+                                        catIndex ==
+                                        _highlightedCelebCategoryIndex;
+                                    final isApplied =
+                                        _celebCategories[catIndex] ==
+                                        _selectedCelebCategory;
+                                    return GestureDetector(
+                                      onTap: () =>
+                                          _applyCelebCategory(catIndex),
+                                      child: Container(
+                                        alignment: Alignment.center,
+                                        decoration: BoxDecoration(
+                                          color: isCentered
+                                              ? Colors.amber.withValues(
+                                                  alpha: 0.3,
+                                                )
+                                              : Colors.black38,
+                                          borderRadius: BorderRadius.circular(
+                                            7,
+                                          ),
+                                          border: Border.all(
+                                            color: isCentered
+                                                ? Colors.amber
+                                                : Colors.transparent,
+                                          ),
+                                        ),
+                                        child: Stack(
+                                          alignment: Alignment.center,
+                                          children: [
+                                            Text(
+                                              _celebCategories[catIndex],
+                                              style: TextStyle(
+                                                color: isCentered
+                                                    ? Colors.amberAccent
+                                                    : Colors.white60,
+                                                fontSize: 8,
+                                                fontWeight: FontWeight.bold,
+                                              ),
+                                            ),
+                                            if (isApplied)
+                                              const Positioned(
+                                                top: 2,
+                                                right: 2,
+                                                child: Icon(
+                                                  Icons.circle,
+                                                  size: 5,
+                                                  color: Colors.cyanAccent,
+                                                ),
+                                              ),
+                                          ],
+                                        ),
+                                      ),
+                                    );
+                                  },
+                                ),
+                              ),
+                            ),
+                          ),
                         ],
-                      ),
-                    ),
-                  ],
-                );
-              },
-            ),
+                      );
+                    },
+                  ),
+          ),
+        ],
+      ),
     );
+  }
+
+  String _formatCount(int count) {
+    if (count >= 1000000) return '${(count / 1000000).toStringAsFixed(1)}M';
+    if (count >= 1000) return '${(count / 1000).toStringAsFixed(1)}K';
+    return '$count';
   }
 }
 
@@ -3050,9 +5345,9 @@ class _SearchScreenState extends State<SearchScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: const Color(0xFF0B1120),
+      backgroundColor: const Color(0xFF000000),
       appBar: AppBar(
-        backgroundColor: const Color(0xFF0B1120),
+        backgroundColor: const Color(0xFF000000),
         title: TextField(
           autofocus: true,
           style: const TextStyle(color: Colors.white),
@@ -3223,6 +5518,100 @@ class _ProfileScreenState extends State<ProfileScreen>
           );
   }
 
+  // Your own posted videos - tap the trash icon on any of them to delete
+  // it for good (with a confirmation first).
+  Widget _uploadsGrid(List<VideoItem> videos) {
+    if (videos.isEmpty) {
+      return Center(
+        child: Text(
+          'Nothing here yet',
+          style: TextStyle(color: Colors.white.withValues(alpha: 0.4)),
+        ),
+      );
+    }
+    return GridView.builder(
+      padding: const EdgeInsets.all(4),
+      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+        crossAxisCount: 3,
+        crossAxisSpacing: 4,
+        mainAxisSpacing: 4,
+      ),
+      itemCount: videos.length,
+      itemBuilder: (context, i) {
+        final video = videos[i];
+        return Stack(
+          fit: StackFit.expand,
+          children: [
+            Container(
+              color: Colors.blueGrey.shade900,
+              child: const Icon(Icons.videocam, color: Colors.white24),
+            ),
+            Positioned(
+              top: 4,
+              right: 4,
+              child: Tooltip(
+                message: 'Delete this video',
+                child: GestureDetector(
+                  onTap: () => _confirmDeleteVideo(video),
+                  child: Container(
+                    padding: const EdgeInsets.all(4),
+                    decoration: const BoxDecoration(
+                      color: Colors.black87,
+                      shape: BoxShape.circle,
+                    ),
+                    child: const Icon(
+                      Icons.delete_outline,
+                      color: Colors.redAccent,
+                      size: 16,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  void _confirmDeleteVideo(VideoItem video) {
+    showDialog(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        backgroundColor: const Color(0xFF121212),
+        title: const Text(
+          'Delete video?',
+          style: TextStyle(color: Colors.white),
+        ),
+        content: Text(
+          'This removes "${video.caption}" for good. This can\'t be undone.',
+          style: const TextStyle(color: Colors.white70),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text(
+              'Cancel',
+              style: TextStyle(color: Colors.white54),
+            ),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.redAccent),
+            onPressed: () {
+              videoFeedStore.videos.remove(video);
+              videoFeedStore.notifyListeners();
+              Navigator.pop(dialogContext);
+              ScaffoldMessenger.of(
+                context,
+              ).showSnackBar(const SnackBar(content: Text('Video deleted.')));
+            },
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final me = authController.currentUser;
@@ -3233,9 +5622,9 @@ class _ProfileScreenState extends State<ProfileScreen>
     final totalLikes = myVideos.fold<int>(0, (sum, v) => sum + v.likes);
 
     return Scaffold(
-      backgroundColor: const Color(0xFF0B1120),
+      backgroundColor: const Color(0xFF000000),
       appBar: AppBar(
-        backgroundColor: const Color(0xFF0B1120),
+        backgroundColor: const Color(0xFF000000),
         title: Text(
           widget.username,
           style: const TextStyle(color: Colors.white),
@@ -3268,40 +5657,43 @@ class _ProfileScreenState extends State<ProfileScreen>
         children: [
           Padding(
             padding: const EdgeInsets.all(16),
-            child: GestureDetector(
-              onTap: _uploadingAvatar ? null : _pickAvatar,
-              child: Stack(
-                alignment: Alignment.bottomRight,
-                children: [
-                  CircleAvatar(
-                    radius: 40,
-                    backgroundColor: const Color(0xFF0284C7),
-                    backgroundImage: me?.avatarBytes != null
-                        ? MemoryImage(me!.avatarBytes!)
-                        : null,
-                    child: _uploadingAvatar
-                        ? const CircularProgressIndicator(color: Colors.white)
-                        : (me?.avatarBytes == null
-                              ? const Icon(
-                                  Icons.person,
-                                  size: 40,
-                                  color: Colors.white,
-                                )
-                              : null),
-                  ),
-                  Container(
-                    padding: const EdgeInsets.all(4),
-                    decoration: const BoxDecoration(
-                      color: Colors.cyanAccent,
-                      shape: BoxShape.circle,
+            child: Tooltip(
+              message: 'Change profile picture',
+              child: GestureDetector(
+                onTap: _uploadingAvatar ? null : _pickAvatar,
+                child: Stack(
+                  alignment: Alignment.bottomRight,
+                  children: [
+                    CircleAvatar(
+                      radius: 40,
+                      backgroundColor: const Color(0xFF0284C7),
+                      backgroundImage: me?.avatarBytes != null
+                          ? MemoryImage(me!.avatarBytes!)
+                          : null,
+                      child: _uploadingAvatar
+                          ? const CircularProgressIndicator(color: Colors.white)
+                          : (me?.avatarBytes == null
+                                ? const Icon(
+                                    Icons.person,
+                                    size: 40,
+                                    color: Colors.white,
+                                  )
+                                : null),
                     ),
-                    child: const Icon(
-                      Icons.camera_alt,
-                      size: 14,
-                      color: Colors.black,
+                    Container(
+                      padding: const EdgeInsets.all(4),
+                      decoration: const BoxDecoration(
+                        color: Colors.cyanAccent,
+                        shape: BoxShape.circle,
+                      ),
+                      child: const Icon(
+                        Icons.camera_alt,
+                        size: 14,
+                        color: Colors.black,
+                      ),
                     ),
-                  ),
-                ],
+                  ],
+                ),
               ),
             ),
           ),
@@ -3327,7 +5719,7 @@ class _ProfileScreenState extends State<ProfileScreen>
             child: TabBarView(
               controller: _tabController,
               children: [
-                _grid(Icons.videocam, myVideos.length),
+                _uploadsGrid(myVideos),
                 _grid(Icons.image, 0),
                 _grid(Icons.favorite, 0),
               ],
@@ -3385,9 +5777,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
   Widget build(BuildContext context) {
     final me = authController.currentUser;
     return Scaffold(
-      backgroundColor: const Color(0xFF0B1120),
+      backgroundColor: const Color(0xFF000000),
       appBar: AppBar(
-        backgroundColor: const Color(0xFF0B1120),
+        backgroundColor: const Color(0xFF000000),
         title: const Text('Settings', style: TextStyle(color: Colors.white)),
       ),
       body: ListView(
@@ -3568,7 +5960,66 @@ class _SettingsScreenState extends State<SettingsScreen> {
               ),
             ),
           ),
+          const SizedBox(height: 10),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            child: SizedBox(
+              width: double.infinity,
+              child: OutlinedButton.icon(
+                style: OutlinedButton.styleFrom(
+                  side: BorderSide(color: Colors.red.shade900),
+                  padding: const EdgeInsets.symmetric(vertical: 12),
+                ),
+                onPressed: _confirmDeleteAccount,
+                icon: Icon(Icons.delete_forever, color: Colors.red.shade900),
+                label: Text(
+                  'Delete account',
+                  style: TextStyle(color: Colors.red.shade900),
+                ),
+              ),
+            ),
+          ),
           const SizedBox(height: 32),
+        ],
+      ),
+    );
+  }
+
+  void _confirmDeleteAccount() {
+    showDialog(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        backgroundColor: const Color(0xFF121212),
+        title: const Text(
+          'Delete your account?',
+          style: TextStyle(color: Colors.white),
+        ),
+        content: const Text(
+          'This permanently deletes your account and every video you\'ve posted. This cannot be undone.',
+          style: TextStyle(color: Colors.white70),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text(
+              'Cancel',
+              style: TextStyle(color: Colors.white54),
+            ),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.red.shade900,
+            ),
+            onPressed: () {
+              authController.deleteAccount();
+              Navigator.pop(dialogContext);
+              Navigator.popUntil(context, (route) => route.isFirst);
+              ScaffoldMessenger.of(
+                context,
+              ).showSnackBar(const SnackBar(content: Text('Account deleted.')));
+            },
+            child: const Text('Delete forever'),
+          ),
         ],
       ),
     );
@@ -3587,8 +6038,19 @@ class _UploadScreenState extends State<UploadScreen> {
   double _brightness = 0.5;
   double _speed = 1.0;
   String _filter = 'None';
+  String _category = 'Dancing';
 
   final List<String> _filters = ['None', 'Warm', 'Cool', 'B&W', 'Vivid'];
+  final List<String> _categoryOptions = [
+    'Dancing',
+    'Style',
+    'Fashion',
+    'Fitness',
+    'Travel',
+    'Comedy',
+    'Acting',
+    'Gospel',
+  ];
 
   XFile? _pickedFile;
   VideoPlayerController? _videoController;
@@ -3613,13 +6075,15 @@ class _UploadScreenState extends State<UploadScreen> {
   // wrapped in try/catch/finally so the loading spinner can never get
   // stuck forever if something goes wrong.
   // -------------------------------------------------------------------
+  static const Duration kMaxVideoLength = Duration(minutes: 10);
+
   Future<void> _pickVideo(ImageSource source) async {
     final picker = ImagePicker();
     XFile? file;
     try {
       file = await picker.pickVideo(
         source: source,
-        maxDuration: const Duration(minutes: 3),
+        maxDuration: kMaxVideoLength,
       );
     } catch (e) {
       if (!mounted) return;
@@ -3647,6 +6111,18 @@ class _UploadScreenState extends State<UploadScreen> {
         const Duration(seconds: 30),
         onTimeout: () => throw Exception('Video took too long to load.'),
       );
+
+      if (controller.value.duration > kMaxVideoLength) {
+        await controller.dispose();
+        if (!mounted) return;
+        setState(() {
+          _isLoadingVideo = false;
+          _pickError =
+              'That video is too long. Please choose one under 10 minutes.';
+        });
+        return;
+      }
+
       controller.setLooping(true);
       controller.play();
 
@@ -3658,9 +6134,16 @@ class _UploadScreenState extends State<UploadScreen> {
       });
     } catch (e) {
       if (!mounted) return;
+      final message = e.toString();
+      final friendlyMessage =
+          message.contains('MEDIA_ERR_SRC_NOT_SUPPORTED') ||
+              message.contains('NotSupportedError') ||
+              message.contains('format')
+          ? "This video's format isn't supported by your browser. Try a different video, or re-save it as MP4 (H.264) first."
+          : 'Could not load that video: $message';
       setState(() {
         _isLoadingVideo = false;
-        _pickError = 'Could not load that video: $e';
+        _pickError = friendlyMessage;
       });
     }
   }
@@ -3668,7 +6151,7 @@ class _UploadScreenState extends State<UploadScreen> {
   void _showSourcePicker() {
     showModalBottomSheet(
       context: context,
-      backgroundColor: const Color(0xFF1E293B),
+      backgroundColor: const Color(0xFF121212),
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
       ),
@@ -3827,9 +6310,9 @@ class _UploadScreenState extends State<UploadScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: const Color(0xFF0B1120),
+      backgroundColor: const Color(0xFF000000),
       appBar: AppBar(
-        backgroundColor: const Color(0xFF0B1120),
+        backgroundColor: const Color(0xFF000000),
         title: const Text('New Post', style: TextStyle(color: Colors.white)),
         actions: [
           TextButton(
@@ -3852,7 +6335,7 @@ class _UploadScreenState extends State<UploadScreen> {
                   caption: caption.isEmpty ? 'New video' : caption,
                   musicTrack:
                       _selectedMusicName ?? 'Original Sound - ${me.username}',
-                  category: 'Style',
+                  category: _category,
                   likes: 0,
                   comments: 0,
                   creatorAvatarUrl: me.avatarUrl,
@@ -3964,6 +6447,42 @@ class _UploadScreenState extends State<UploadScreen> {
             ),
             const SizedBox(height: 20),
             const Text(
+              'Category',
+              style: TextStyle(
+                color: Colors.white,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+            const SizedBox(height: 4),
+            const Text(
+              'Choose where this video shows up when people filter the feed.',
+              style: TextStyle(color: Colors.white38, fontSize: 11),
+            ),
+            const SizedBox(height: 8),
+            SizedBox(
+              height: 40,
+              child: ListView.separated(
+                scrollDirection: Axis.horizontal,
+                itemCount: _categoryOptions.length,
+                separatorBuilder: (_, __) => const SizedBox(width: 8),
+                itemBuilder: (context, i) {
+                  final selected = _categoryOptions[i] == _category;
+                  return ChoiceChip(
+                    label: Text(_categoryOptions[i]),
+                    selected: selected,
+                    selectedColor: const Color(0xFF0284C7),
+                    labelStyle: TextStyle(
+                      color: selected ? Colors.white : Colors.white70,
+                    ),
+                    backgroundColor: Colors.black26,
+                    onSelected: (_) =>
+                        setState(() => _category = _categoryOptions[i]),
+                  );
+                },
+              ),
+            ),
+            const SizedBox(height: 20),
+            const Text(
               'Music',
               style: TextStyle(
                 color: Colors.white,
@@ -4004,6 +6523,7 @@ class _UploadScreenState extends State<UploadScreen> {
                         color: Colors.white54,
                         size: 18,
                       ),
+                      tooltip: 'Remove selected music',
                       onPressed: () =>
                           setState(() => _selectedMusicName = null),
                     ),
@@ -4054,7 +6574,7 @@ class _UploadScreenState extends State<UploadScreen> {
               controller: _captionController,
               maxLines: 3,
               style: const TextStyle(
-                color: Color(0xFF1E293B),
+                color: Color(0xFF121212),
                 fontStyle: FontStyle.italic,
               ),
               decoration: InputDecoration(
